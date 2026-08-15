@@ -1,0 +1,49 @@
+name: Profile README polish (one-shot)
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/profile-readme-once.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  polish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Insert engineering snapshot
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('README.md'); text=p.read_text(encoding='utf-8')
+          start='<!-- profile-intro:start -->'; end='<!-- profile-intro:end -->'
+          block='''<!-- profile-intro:start -->
+
+> **工程概览** — 面向真实代码仓库的轻量本地 Coding Agent：先理解当前工作区，再通过受约束的文件/命令工具推进工程任务，并将 session、run trace 与执行结果持久化到本地，支持多种 LLM Provider 后端切换。
+
+**Engineering Highlights**
+- **Repository-aware agent**：围绕当前代码仓库执行读取、修改、命令运行与测试排查，而不是脱离上下文的纯聊天。
+- **Persistent execution**：持久化会话、任务状态、trace 与 report，支持中断后继续工作和结果追踪。
+- **Provider abstraction**：统一接入 DeepSeek、OpenAI-compatible、Anthropic-compatible 与 Ollama 等模型后端。
+- **Controlled tooling**：通过审批模式约束文件写入和 Shell 执行，兼顾自动化效率与可控性。
+
+`Python` · `AI Agent` · `Tool Calling` · `CLI` · `Persistent Sessions` · `Multi-Provider LLM`
+
+<!-- profile-intro:end -->'''
+          if start in text and end in text:
+              a=text.index(start); b=text.index(end,a)+len(end); text=text[:a]+block+text[b:]
+          else:
+              lines=text.splitlines(keepends=True); idx=next((i+1 for i,l in enumerate(lines) if l.startswith('# ')),0); lines.insert(idx,'\n'+block+'\n\n'); text=''.join(lines)
+          p.write_text(text,encoding='utf-8')
+      - name: Commit README and cleanup
+        run: |
+          rm -f .github/profile-description.txt .github/workflows/profile-readme-once.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: polish project introduction"
+          git push origin main
