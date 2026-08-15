@@ -1,1 +1,0 @@
-Lightweight local coding agent with constrained tools, persistent sessions and multi-provider LLM backends.
