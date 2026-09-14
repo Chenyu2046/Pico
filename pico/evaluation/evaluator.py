@@ -4,11 +4,13 @@ import locale as locale_module
 import shutil
 import subprocess
 import tempfile
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ..features import memory as memorylib
+from ..action_chunk import normalize_action_chunking
 from ..providers.clients import FakeModelClient
 from ..runtime import Pico, SessionStore
 from ..run_store import RunStore
@@ -26,6 +28,77 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_NEW_TOKENS = 64
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+ACTION_CHUNKING_BENCHMARK_SCHEMA_VERSION = 1
+_ACTION_CHUNKING_ALLOWED_TOOLS = list(("list_files", "read_file", "search"))
+ACTION_CHUNKING_BENCHMARK_MATRIX = (
+    {
+        "id": "A",
+        "name": "react_single_action",
+        "semantics": {
+            "chunking": "disabled",
+            "boundary": "single primitive action per logical decision",
+            "skill_guidance": False,
+        },
+        "action_chunking": normalize_action_chunking({"enabled": False}),
+    },
+    {
+        "id": "B",
+        "name": "chunk_hard_boundaries",
+        "semantics": {
+            "chunking": "variable length read-only chunks",
+            "boundary": "runtime hard boundaries only",
+            "skill_guidance": False,
+        },
+        "action_chunking": normalize_action_chunking(
+            {
+                "enabled": True,
+                "allowed_tools": _ACTION_CHUNKING_ALLOWED_TOOLS,
+                # Keep B's observation boundary out of the fixed workload;
+                # C makes this boundary an explicit treatment variable.
+                "observation_budget_chars": 1_000_000,
+            }
+        ),
+    },
+    {
+        "id": "C",
+        "name": "chunk_observation_boundary",
+        "semantics": {
+            "chunking": "variable length read-only chunks",
+            "boundary": "hard boundaries plus observation budget/replanning",
+            "skill_guidance": False,
+        },
+        "action_chunking": normalize_action_chunking(
+            {
+                "enabled": True,
+                "allowed_tools": _ACTION_CHUNKING_ALLOWED_TOOLS,
+                "observation_budget_chars": 12_000,
+            }
+        ),
+    },
+    {
+        "id": "D",
+        "name": "chunk_observation_and_skill_guidance",
+        "semantics": {
+            "chunking": "variable length read-only chunks",
+            "boundary": "hard boundaries plus observation budget/replanning",
+            "skill_guidance": True,
+        },
+        "action_chunking": normalize_action_chunking(
+            {
+                "enabled": True,
+                "allowed_tools": _ACTION_CHUNKING_ALLOWED_TOOLS,
+                "observation_budget_chars": 12_000,
+                "skill_guidance_enabled": True,
+            }
+        ),
+    },
+)
+
+
+def build_action_chunking_benchmark_matrix():
+    """Return the fixed A/B/C/D treatment matrix without running it."""
+    return deepcopy(list(ACTION_CHUNKING_BENCHMARK_MATRIX))
 
 REQUIRED_BENCHMARK_KEYS = ("schema_version", "tasks")
 REQUIRED_TASK_KEYS = (
@@ -386,6 +459,7 @@ class BenchmarkEvaluator:
         max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
         timezone_name=DEFAULT_TIMEZONE,
         model_client_factory=None,
+        action_chunking=None,
     ):
         self.benchmark_path = Path(benchmark_path)
         self.artifact_path = Path(artifact_path)
@@ -399,6 +473,7 @@ class BenchmarkEvaluator:
         self.max_new_tokens = max_new_tokens
         self.timezone_name = timezone_name
         self.model_client_factory = model_client_factory
+        self.action_chunking = normalize_action_chunking(action_chunking)
         self.repo_root = self.benchmark_path.resolve().parent.parent
 
     def load(self):
@@ -432,6 +507,8 @@ class BenchmarkEvaluator:
                 },
                 "timezone": self.timezone_name,
                 "locale": _current_locale(),
+                "task_ids": [task["id"] for task in benchmark["tasks"]],
+                "action_chunking": dict(self.action_chunking),
             },
             "summary": summary,
             "failure_category_counts": summary["failure_category_counts"],
@@ -468,6 +545,7 @@ class BenchmarkEvaluator:
             max_steps=int(task["step_budget"]),
             max_new_tokens=self.max_new_tokens,
             allowed_tools=task["allowed_tools"],
+            action_chunking=self.action_chunking,
         )
         _apply_task_setup(agent, task, fixture_copy_root)
 
@@ -537,6 +615,26 @@ class BenchmarkEvaluator:
             "non_failure_stop_reason": non_failure_stop_reason,
             "tool_steps": task_state.tool_steps,
             "attempts": task_state.attempts,
+            "logical_decisions": task_state.logical_decisions,
+            "provider_requests": task_state.provider_requests,
+            "provider_retries": task_state.provider_retries,
+            "provider_responses": task_state.provider_responses,
+            "provider_attempts": [dict(attempt) for attempt in task_state.provider_attempts],
+            "usage_missing_responses": task_state.usage_missing_responses,
+            "usage_missing_rate": (
+                task_state.usage_missing_responses / task_state.provider_responses
+                if task_state.provider_responses
+                else 0.0
+            ),
+            "auxiliary_requests": task_state.auxiliary_requests,
+            "primitive_tool_calls": task_state.primitive_tool_calls,
+            "chunk_count": task_state.chunk_count,
+            "chunk_interrupt_rate": (
+                task_state.chunk_interrupts / task_state.chunk_count
+                if task_state.chunk_count
+                else 0.0
+            ),
+            "chunk_lengths": list(task_state.chunk_lengths),
             "final_answer": final_answer,
             "stop_reason": task_state.stop_reason,
             "initial_history_empty": initial_history_empty,
@@ -584,6 +682,7 @@ def run_fixed_benchmark(
     max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     timezone_name=DEFAULT_TIMEZONE,
     model_client_factory=None,
+    action_chunking=None,
 ):
     evaluator = BenchmarkEvaluator(
         benchmark_path=benchmark_path,
@@ -596,6 +695,7 @@ def run_fixed_benchmark(
         max_new_tokens=max_new_tokens,
         timezone_name=timezone_name,
         model_client_factory=model_client_factory,
+        action_chunking=action_chunking,
     )
     return evaluator.run()
 

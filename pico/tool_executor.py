@@ -22,6 +22,8 @@ def _metadata(
     workspace_changed=False,
     workspace_fingerprint="",
     diff_summary=None,
+    truncated=False,
+    output_chars=0,
 ):
     result = {
         "tool_status": tool_status,
@@ -32,6 +34,8 @@ def _metadata(
         "affected_paths": list(affected_paths or []),
         "workspace_changed": bool(workspace_changed),
         "diff_summary": list(diff_summary or []),
+        "truncated": bool(truncated),
+        "output_chars": int(output_chars),
     }
     if workspace_fingerprint:
         result["workspace_fingerprint"] = workspace_fingerprint
@@ -112,7 +116,8 @@ class ToolExecutor:
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            content = clip(tool["run"](args))
+            raw_content = str(tool["run"](args))
+            content = clip(raw_content)
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -137,6 +142,8 @@ class ToolExecutor:
                 workspace_changed=workspace_changed,
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
+                truncated=content != raw_content,
+                output_chars=len(content),
             )
             agent.record_process_note_for_tool(name, metadata)
             return ToolExecutionResult(content=content, metadata=metadata)

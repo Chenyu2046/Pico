@@ -118,6 +118,17 @@ def _configured_secret_names(args):
     return sorted(configured_secret_names)
 
 
+def _action_chunking_config(args):
+    allowed_tools = getattr(args, "chunk_allowed_tools", None) or ("list_files", "read_file", "search")
+    return {
+        "enabled": bool(getattr(args, "action_chunking_enabled", False)),
+        "max_actions_per_chunk": int(getattr(args, "max_actions_per_chunk", 4)),
+        "allowed_tools": list(allowed_tools),
+        "observation_budget_chars": int(getattr(args, "observation_budget_chars", 12000)),
+        "skill_guidance_enabled": bool(getattr(args, "skill_guidance_enabled", False)),
+    }
+
+
 def _build_model_client(args):
     provider = _effective_provider(args)
     # CLI 只负责把 provider 选择翻译成具体 client。
@@ -258,6 +269,7 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            action_chunking=_action_chunking_config(args),
         )
     return Pico(
         model_client=model,
@@ -267,6 +279,7 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        action_chunking=_action_chunking_config(args),
     )
 
 
@@ -305,6 +318,22 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--action-chunking", dest="action_chunking_enabled", action="store_true", help="Enable read-only action chunks.")
+    parser.add_argument("--max-actions-per-chunk", type=int, default=4, help="Maximum read-only actions in one chunk.")
+    parser.add_argument(
+        "--chunk-allowed-tool",
+        dest="chunk_allowed_tools",
+        action="append",
+        default=None,
+        help="Read-only tool allowed in chunks; repeat to override the default list.",
+    )
+    parser.add_argument(
+        "--observation-budget-chars",
+        type=int,
+        default=12000,
+        help="Maximum cumulative chunk observation characters before replanning.",
+    )
+    parser.add_argument("--skill-guidance", dest="skill_guidance_enabled", action="store_true", help="Enable advisory skill guidance for chunks.")
     return parser
 
 

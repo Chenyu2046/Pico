@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import checkpoint as checkpointlib
+from .action_chunk import normalize_action_chunking
 from .features import memory as memorylib
 from . import security as securitylib
 from .context_manager import ContextManager
@@ -68,6 +69,7 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        action_chunking=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -85,6 +87,7 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        self.action_chunking = normalize_action_chunking(action_chunking)
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
@@ -137,7 +140,9 @@ class Pico:
             checkpoints = {}
             self.session["checkpoints"] = checkpoints
         checkpoints.setdefault("current_id", "")
-        checkpoints.setdefault("items", {})
+        items = checkpoints.setdefault("items", {})
+        if not isinstance(items, dict):
+            checkpoints["items"] = {}
         runtime_identity = self.session.setdefault("runtime_identity", {})
         if not isinstance(runtime_identity, dict):
             self.session["runtime_identity"] = {}
@@ -204,7 +209,11 @@ class Pico:
         return tool_signature(self.tools)
 
     def build_prefix(self):
-        return build_prompt_prefix(workspace=self.workspace, tools=self.tools)
+        return build_prompt_prefix(
+            workspace=self.workspace,
+            tools=self.tools,
+            action_chunking=self.action_chunking,
+        )
 
     def _apply_prefix_state(self, prefix_state):
         self.prefix_state = prefix_state
@@ -379,8 +388,14 @@ class Pico:
                 summaries.append(f"modified:{path}")
         return changed_paths, summaries
 
-    def create_checkpoint(self, task_state, user_message, trigger):
-        return checkpointlib.create_checkpoint(self, task_state, user_message, trigger)
+    def create_checkpoint(self, task_state, user_message, trigger, action_result=None):
+        return checkpointlib.create_checkpoint(
+            self,
+            task_state,
+            user_message,
+            trigger,
+            action_result=action_result,
+        )
 
     def infer_next_step(self, task_state):
         return checkpointlib.infer_next_step(task_state)
@@ -566,6 +581,29 @@ class Pico:
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
+            "action_chunking": dict(self.action_chunking),
+            "metrics": {
+                "logical_decisions": task_state.logical_decisions,
+                "provider_requests": task_state.provider_requests,
+                "provider_retries": task_state.provider_retries,
+                "provider_responses": task_state.provider_responses,
+                "provider_attempts": [dict(attempt) for attempt in task_state.provider_attempts],
+                "usage_missing_responses": task_state.usage_missing_responses,
+                "usage_missing_rate": (
+                    task_state.usage_missing_responses / task_state.provider_responses
+                    if task_state.provider_responses
+                    else 0.0
+                ),
+                "auxiliary_requests": task_state.auxiliary_requests,
+                "primitive_tool_calls": task_state.primitive_tool_calls,
+                "chunk_count": task_state.chunk_count,
+                "chunk_interrupt_rate": (
+                    task_state.chunk_interrupts / task_state.chunk_count
+                    if task_state.chunk_count
+                    else 0.0
+                ),
+                "chunk_lengths": list(task_state.chunk_lengths),
+            },
         }
 
     def tool_example(self, name):
@@ -652,13 +690,43 @@ class Pico:
 
         输入 / 输出：
         - 输入：模型返回的原始文本 `raw`
-        - 输出：`(kind, payload)`，其中 `kind` 可能是 `tool`、`final`、`retry`
+        - 输出：`(kind, payload)`，其中 `kind` 可能是 `tool`、`chunk`、`final`、`retry`
 
         在 agent 链路里的位置：
         它位于 `model_client.complete()` 之后、`run_tool()` 之前，是模型输出
         进入平台控制流的第一道结构化关口。
         """
         raw = str(raw)
+        stripped = raw.strip()
+        if stripped.startswith("{"):
+            try:
+                structured = json.loads(stripped)
+            except Exception:
+                structured = None
+            if isinstance(structured, dict) and structured.get("type") in {"tool", "chunk", "final"}:
+                kind = structured.pop("type")
+                if kind == "chunk" and "skill" in structured and "skill_id" not in structured:
+                    structured["skill_id"] = structured.pop("skill")
+                if kind == "final":
+                    final = str(structured.get("content", structured.get("text", ""))).strip()
+                    return ("final", final) if final else ("retry", Pico.retry_notice("model returned an empty final answer"))
+                if kind == "tool":
+                    if not str(structured.get("name", "")).strip():
+                        return "retry", Pico.retry_notice("tool payload is missing a tool name")
+                    if structured.get("args") is None:
+                        structured["args"] = {}
+                return kind, structured
+        if "<chunk>" in raw and ("<final>" not in raw or raw.find("<chunk>") < raw.find("<final>")):
+            body = Pico.extract(raw, "chunk")
+            try:
+                payload = json.loads(body)
+            except Exception:
+                return "retry", Pico.retry_notice("model returned malformed chunk JSON")
+            if not isinstance(payload, dict):
+                return "retry", Pico.retry_notice("chunk payload must be a JSON object")
+            if "skill" in payload and "skill_id" not in payload:
+                payload["skill_id"] = payload.pop("skill")
+            return "chunk", payload
         # 这里支持两种工具格式：
         # 1. <tool>...</tool> 里包 JSON，适合简短调用
         # 2. XML 风格属性/子标签，适合写文件这类多行内容
@@ -701,7 +769,7 @@ class Pico:
         else:
             prefix += ": model returned malformed tool output"
         return (
-            f"{prefix}. Reply with a valid <tool> call or a non-empty <final> answer. "
+            f"{prefix}. Reply with a valid <tool> call, a valid <chunk> call, or a non-empty <final> answer. "
             'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
         )
 

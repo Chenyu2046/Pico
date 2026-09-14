@@ -7,11 +7,51 @@ runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
 
 import json
 import time
+import uuid
 from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
+
+
+def _provider_metadata(request_id, attempt_id, logical_decision_id, provider_requests, started_at, status="ok", error=""):
+    payload = {
+        "request_id": request_id,
+        "attempt_id": int(attempt_id),
+        "logical_decision_id": logical_decision_id,
+        "provider_requests": int(provider_requests),
+        "provider_retries": max(0, int(provider_requests) - 1),
+        "latency_ms": int((time.monotonic() - started_at) * 1000),
+        "status": status,
+    }
+    if error:
+        payload["error"] = str(error)
+    return payload
+
+
+def _provider_attempt_metadata(
+    request_id,
+    attempt_id,
+    logical_decision_id,
+    provider_requests,
+    started_at,
+    status="ok",
+    error="",
+    details=None,
+):
+    payload = _provider_metadata(
+        request_id,
+        attempt_id,
+        logical_decision_id,
+        provider_requests,
+        started_at,
+        status=status,
+        error=error,
+    )
+    if details:
+        payload.update(dict(details))
+    return payload
 
 
 class FakeModelClient:
@@ -20,13 +60,28 @@ class FakeModelClient:
         self.prompts = []
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
+        self.last_provider_metadata = {}
+        self.last_provider_attempts = []
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         self.prompts.append(prompt)
-        if not getattr(self, "last_completion_metadata", None):
-            self.last_completion_metadata = {}
+        logical_decision_id = kwargs.get("logical_decision_id")
+        request_id = "request_" + uuid.uuid4().hex[:12]
+        started_at = time.monotonic()
+        self.last_completion_metadata = {}
+        self.last_provider_attempts = []
         if not self.outputs:
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(
+                    request_id, 1, logical_decision_id, 1, started_at, status="error", error="fake model ran out of outputs"
+                )
+            )
+            self.last_provider_metadata = _provider_metadata(
+                request_id, 1, logical_decision_id, 1, started_at, status="error", error="fake model ran out of outputs"
+            )
             raise RuntimeError("fake model ran out of outputs")
+        self.last_provider_attempts.append(_provider_attempt_metadata(request_id, 1, logical_decision_id, 1, started_at))
+        self.last_provider_metadata = _provider_metadata(request_id, 1, logical_decision_id, 1, started_at)
         return self.outputs.pop(0)
 
 
@@ -39,11 +94,17 @@ class OllamaModelClient:
         self.timeout = timeout
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
+        self.last_provider_metadata = {}
+        self.last_provider_attempts = []
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         # Ollama 当前不支持我们这里接入的 prompt cache 语义，
         # 所以 runtime 传下来的缓存参数会被忽略。
+        logical_decision_id = kwargs.pop("logical_decision_id", None)
         self.last_completion_metadata = {}
+        self.last_provider_attempts = []
+        request_id = "request_" + uuid.uuid4().hex[:12]
+        started_at = time.monotonic()
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -67,8 +128,20 @@ class OllamaModelClient:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(request_id, 1, logical_decision_id, 1, started_at, status="error", error=exc)
+            )
+            self.last_provider_metadata = _provider_metadata(
+                request_id, 1, logical_decision_id, 1, started_at, status="error", error=exc
+            )
             raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(request_id, 1, logical_decision_id, 1, started_at, status="error", error=exc)
+            )
+            self.last_provider_metadata = _provider_metadata(
+                request_id, 1, logical_decision_id, 1, started_at, status="error", error=exc
+            )
             raise RuntimeError(
                 "Could not reach Ollama.\n"
                 "Make sure `ollama serve` is running and the model is available.\n"
@@ -77,7 +150,15 @@ class OllamaModelClient:
             ) from exc
 
         if data.get("error"):
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(request_id, 1, logical_decision_id, 1, started_at, status="error", error=data["error"])
+            )
+            self.last_provider_metadata = _provider_metadata(
+                request_id, 1, logical_decision_id, 1, started_at, status="error", error=data["error"]
+            )
             raise RuntimeError(f"Ollama error: {data['error']}")
+        self.last_provider_attempts.append(_provider_attempt_metadata(request_id, 1, logical_decision_id, 1, started_at))
+        self.last_provider_metadata = _provider_metadata(request_id, 1, logical_decision_id, 1, started_at)
         return data.get("response", "")
 
 
@@ -213,13 +294,15 @@ def _extract_usage_cache_details(data):
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
     input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
-    cached_tokens = int(input_details.get("cached_tokens") or 0)
+    cached_tokens = input_details.get("cached_tokens")
+    if cached_tokens is not None:
+        cached_tokens = int(cached_tokens)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": usage.get("total_tokens"),
         "cached_tokens": cached_tokens,
-        "cache_hit": cached_tokens > 0,
+        "cache_hit": bool(cached_tokens and cached_tokens > 0),
     }
 
 
@@ -234,8 +317,24 @@ class OpenAICompatibleModelClient:
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
         self.last_completion_metadata = {}
+        self.last_provider_metadata = {}
+        self.last_provider_attempts = []
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+    def _record_provider_result(self, request_id, attempt_id, logical_decision_id, provider_requests, started_at, status="ok", error=""):
+        self.last_provider_metadata = {
+            **_provider_metadata(
+                request_id,
+                attempt_id,
+                logical_decision_id,
+                provider_requests,
+                started_at,
+                status=status,
+                error=error,
+            ),
+            **dict(self.last_completion_metadata or {}),
+        }
+
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, logical_decision_id=None):
         """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
 
         为什么存在：
@@ -253,6 +352,11 @@ class OpenAICompatibleModelClient:
         落到 provider API 的地方。
         """
         self.last_completion_metadata = {}
+        self.last_provider_metadata = {}
+        self.last_provider_attempts = []
+        request_id = "request_" + uuid.uuid4().hex[:12]
+        started_at = time.monotonic()
+        provider_requests = 0
         payload = {
             "model": self.model,
             "input": [
@@ -294,6 +398,8 @@ class OpenAICompatibleModelClient:
         )
         attempts = 3
         for attempt in range(attempts):
+            provider_requests = attempt + 1
+            attempt_started_at = time.monotonic()
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     body_text = response.read().decode("utf-8")
@@ -303,13 +409,43 @@ class OpenAICompatibleModelClient:
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
                 if exc.code >= 500 and attempt < attempts - 1:
+                    self.last_provider_attempts.append(
+                        _provider_attempt_metadata(
+                            request_id, attempt + 1, logical_decision_id, provider_requests,
+                            attempt_started_at, status="retry", error=exc
+                        )
+                    )
                     time.sleep(0.5 * (attempt + 1))
                     continue
+                self.last_provider_attempts.append(
+                    _provider_attempt_metadata(
+                        request_id, attempt + 1, logical_decision_id, provider_requests,
+                        attempt_started_at, status="error", error=exc
+                    )
+                )
+                self._record_provider_result(
+                    request_id, attempt + 1, logical_decision_id, provider_requests, started_at, status="error", error=exc
+                )
                 raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
                 if attempt < attempts - 1:
+                    self.last_provider_attempts.append(
+                        _provider_attempt_metadata(
+                            request_id, attempt + 1, logical_decision_id, provider_requests,
+                            attempt_started_at, status="retry", error=exc
+                        )
+                    )
                     time.sleep(0.5 * (attempt + 1))
                     continue
+                self.last_provider_attempts.append(
+                    _provider_attempt_metadata(
+                        request_id, attempt + 1, logical_decision_id, provider_requests,
+                        attempt_started_at, status="error", error=exc
+                    )
+                )
+                self._record_provider_result(
+                    request_id, attempt + 1, logical_decision_id, provider_requests, started_at, status="error", error=exc
+                )
                 raise RuntimeError(
                     "Could not reach the OpenAI-compatible backend.\n"
                     f"Base URL: {self.base_url}\n"
@@ -329,6 +465,23 @@ class OpenAICompatibleModelClient:
                     "prompt_cache_retention": prompt_cache_retention,
                     **_extract_usage_cache_details(response_data),
                 }
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(
+                    request_id,
+                    attempt + 1,
+                    logical_decision_id,
+                    provider_requests,
+                    attempt_started_at,
+                    status="ok" if text else "error",
+                    error="could not extract text from event stream response" if not text else "",
+                    details=_extract_usage_cache_details(response_data) if isinstance(response_data, dict) else None,
+                )
+            )
+            self._record_provider_result(
+                request_id, attempt + 1, logical_decision_id, provider_requests, started_at,
+                status="ok" if text else "error",
+                error="could not extract text from event stream response" if not text else "",
+            )
             if text:
                 return text
             raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
@@ -336,10 +489,28 @@ class OpenAICompatibleModelClient:
         try:
             data = json.loads(body_text)
         except json.JSONDecodeError as exc:
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(
+                    request_id, provider_requests, logical_decision_id, provider_requests,
+                    attempt_started_at, status="error", error=exc
+                )
+            )
+            self._record_provider_result(
+                request_id, provider_requests, logical_decision_id, provider_requests, started_at, status="error", error=exc
+            )
             raise RuntimeError(
                 "OpenAI-compatible error: backend returned non-JSON content that could not be parsed"
             ) from exc
         if data.get("error"):
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(
+                    request_id, provider_requests, logical_decision_id, provider_requests,
+                    attempt_started_at, status="error", error=data["error"]
+                )
+            )
+            self._record_provider_result(
+                request_id, provider_requests, logical_decision_id, provider_requests, started_at, status="error", error=data["error"]
+            )
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
         self.last_completion_metadata = {
             "prompt_cache_supported": self.supports_prompt_cache,
@@ -347,6 +518,19 @@ class OpenAICompatibleModelClient:
             "prompt_cache_retention": prompt_cache_retention,
             **_extract_usage_cache_details(data),
         }
+        self.last_provider_attempts.append(
+            _provider_attempt_metadata(
+                request_id,
+                provider_requests,
+                logical_decision_id,
+                provider_requests,
+                attempt_started_at,
+                details=_extract_usage_cache_details(data),
+            )
+        )
+        self._record_provider_result(
+            request_id, provider_requests, logical_decision_id, provider_requests, started_at
+        )
         return _extract_openai_text(data)
 
 
@@ -386,12 +570,33 @@ class AnthropicCompatibleModelClient:
         self.thinking = dict(thinking) if thinking else None
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
+        self.last_provider_metadata = {}
+        self.last_provider_attempts = []
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+    def _record_provider_result(self, request_id, attempt_id, logical_decision_id, provider_requests, started_at, status="ok", error=""):
+        self.last_provider_metadata = {
+            **_provider_metadata(
+                request_id,
+                attempt_id,
+                logical_decision_id,
+                provider_requests,
+                started_at,
+                status=status,
+                error=error,
+            ),
+            **dict(self.last_completion_metadata or {}),
+        }
+
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, logical_decision_id=None):
         # 为了保持统一接口，runtime 仍然会传缓存参数进来；
         # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
         del prompt_cache_key, prompt_cache_retention
         self.last_completion_metadata = {}
+        self.last_provider_metadata = {}
+        self.last_provider_attempts = []
+        request_id = "request_" + uuid.uuid4().hex[:12]
+        started_at = time.monotonic()
+        provider_requests = 0
         payload = {
             "model": self.model,
             "messages": [
@@ -427,6 +632,8 @@ class AnthropicCompatibleModelClient:
         )
         attempts = 3
         for attempt in range(attempts):
+            provider_requests = attempt + 1
+            attempt_started_at = time.monotonic()
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     body_text = response.read().decode("utf-8")
@@ -434,13 +641,43 @@ class AnthropicCompatibleModelClient:
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
                 if exc.code >= 500 and attempt < attempts - 1:
+                    self.last_provider_attempts.append(
+                        _provider_attempt_metadata(
+                            request_id, attempt + 1, logical_decision_id, provider_requests,
+                            attempt_started_at, status="retry", error=exc
+                        )
+                    )
                     time.sleep(0.5 * (attempt + 1))
                     continue
+                self.last_provider_attempts.append(
+                    _provider_attempt_metadata(
+                        request_id, attempt + 1, logical_decision_id, provider_requests,
+                        attempt_started_at, status="error", error=exc
+                    )
+                )
+                self._record_provider_result(
+                    request_id, attempt + 1, logical_decision_id, provider_requests, started_at, status="error", error=exc
+                )
                 raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
                 if attempt < attempts - 1:
+                    self.last_provider_attempts.append(
+                        _provider_attempt_metadata(
+                            request_id, attempt + 1, logical_decision_id, provider_requests,
+                            attempt_started_at, status="retry", error=exc
+                        )
+                    )
                     time.sleep(0.5 * (attempt + 1))
                     continue
+                self.last_provider_attempts.append(
+                    _provider_attempt_metadata(
+                        request_id, attempt + 1, logical_decision_id, provider_requests,
+                        attempt_started_at, status="error", error=exc
+                    )
+                )
+                self._record_provider_result(
+                    request_id, attempt + 1, logical_decision_id, provider_requests, started_at, status="error", error=exc
+                )
                 raise RuntimeError(
                     "Could not reach the Anthropic-compatible backend.\n"
                     f"Base URL: {self.base_url}\n"
@@ -450,12 +687,43 @@ class AnthropicCompatibleModelClient:
         try:
             data = json.loads(body_text)
         except json.JSONDecodeError as exc:
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(
+                    request_id, provider_requests, logical_decision_id, provider_requests,
+                    attempt_started_at, status="error", error=exc
+                )
+            )
+            self._record_provider_result(
+                request_id, provider_requests, logical_decision_id, provider_requests, started_at, status="error", error=exc
+            )
             raise RuntimeError(
                 "Anthropic-compatible error: backend returned non-JSON content that could not be parsed"
             ) from exc
         if data.get("error"):
+            self.last_provider_attempts.append(
+                _provider_attempt_metadata(
+                    request_id, provider_requests, logical_decision_id, provider_requests,
+                    attempt_started_at, status="error", error=data["error"]
+                )
+            )
+            self._record_provider_result(
+                request_id, provider_requests, logical_decision_id, provider_requests, started_at, status="error", error=data["error"]
+            )
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
         self.last_completion_metadata = _extract_anthropic_metadata(data)
+        self.last_provider_attempts.append(
+            _provider_attempt_metadata(
+                request_id,
+                provider_requests,
+                logical_decision_id,
+                provider_requests,
+                attempt_started_at,
+                details=self.last_completion_metadata,
+            )
+        )
+        self._record_provider_result(
+            request_id, provider_requests, logical_decision_id, provider_requests, started_at
+        )
         text = _extract_anthropic_text(data)
         if text:
             return text

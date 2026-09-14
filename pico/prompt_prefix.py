@@ -5,6 +5,7 @@ import json
 import textwrap
 from dataclasses import dataclass
 
+from .action_chunk import normalize_action_chunking
 from .workspace import now
 
 
@@ -34,23 +35,41 @@ def tool_signature(tools):
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def build_prompt_prefix(workspace, tools, built_at=None):
+def build_prompt_prefix(workspace, tools, built_at=None, action_chunking=None):
+    action_chunking = normalize_action_chunking(action_chunking)
+    chunk_enabled = action_chunking["enabled"]
     tool_lines = []
     for name, tool in tools.items():
         fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
         risk = "approval required" if tool["risky"] else "safe"
         tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
     tool_text = "\n".join(tool_lines)
-    examples = "\n".join(
-        [
-            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-            '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-            '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-            '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-            "<final>Done.</final>",
-        ]
-    )
+    examples = [
+        '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+        '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+        '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
+        '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+        '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+    ]
+    if chunk_enabled:
+        examples.insert(
+            2,
+            '<chunk>{"actions":[{"name":"list_files","args":{"path":"."}},{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}],"skill_id":"inspect_symbol"}</chunk>',
+        )
+    examples.append("<final>Done.</final>")
+    examples = "\n".join(examples)
+    if chunk_enabled:
+        response_rule = "- Return exactly one <tool>...</tool>, one <chunk>...</chunk>, or one <final>...</final>."
+        chunk_rules = (
+            f"- A chunk may contain at most {action_chunking['max_actions_per_chunk']} ordered read-only actions "
+            f"from: {', '.join(action_chunking['allowed_tools'])}."
+            " Do not reference another action's result; use only already-known arguments."
+        )
+        if action_chunking["skill_guidance_enabled"]:
+            chunk_rules += " Skill guidance is advisory; use boundary_hint=true only at a natural inspection boundary."
+    else:
+        response_rule = "- Return exactly one <tool>...</tool> or one <final>...</final>."
+        chunk_rules = ""
     # prefix 可以理解成 agent 的“工作手册”：
     # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
     text = textwrap.dedent(
@@ -59,7 +78,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
 
         Rules:
         - Use tools instead of guessing about the workspace.
-        - Return exactly one <tool>...</tool> or one <final>...</final>.
+        {response_rule}
         - Tool calls must look like:
           <tool>{{"name":"tool_name","args":{{...}}}}</tool>
         - For write_file and patch_file with multi-line text, prefer XML style:
@@ -74,6 +93,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - New files should be complete and runnable, including obvious imports.
         - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
         - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+        {chunk_rules}
 
         Tools:
         {tool_text}

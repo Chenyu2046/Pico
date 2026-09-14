@@ -24,6 +24,7 @@ RUNTIME_IDENTITY_KEYS = (
     "shell_env_allowlist",
     "workspace_fingerprint",
     "tool_signature",
+    "action_chunking",
 )
 
 
@@ -41,6 +42,7 @@ def current_runtime_identity(agent):
         "shell_env_allowlist": list(agent.shell_env_allowlist),
         "workspace_fingerprint": getattr(getattr(agent, "prefix_state", None), "workspace_fingerprint", agent.workspace.fingerprint()),
         "tool_signature": agent.tool_signature(),
+        "action_chunking": dict(getattr(agent, "action_chunking", {}) or {}),
     }
 
 
@@ -57,10 +59,44 @@ def current_checkpoint(agent):
     return state.get("items", {}).get(checkpoint_id)
 
 
+def latest_committed_action(agent):
+    """Return the highest committed primitive action checkpoint, if any."""
+    items = checkpoint_state(agent).get("items", {})
+    committed = [
+        item
+        for item in items.values()
+        if _is_complete_committed_action(item)
+    ]
+    return max(committed, key=lambda item: int(item.get("action_seq", 0) or 0), default=None)
+
+
+def _is_complete_committed_action(item):
+    if not isinstance(item, dict):
+        return False
+    if item.get("committed") is not True or item.get("commit_status") != "committed":
+        return False
+    if item.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        return False
+    checkpoint_id = str(item.get("checkpoint_id", "")).strip()
+    action_id = str(item.get("action_id", "")).strip()
+    action_status = str(item.get("action_status", "")).strip()
+    try:
+        action_seq = int(item.get("action_seq", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        checkpoint_id
+        and action_id
+        and action_status == "completed"
+        and action_seq > 0
+    )
+
+
 def evaluate_resume_state(agent):
     previous_resume_state = dict(agent.session.get("resume_state", {}) or {})
     invalidated = agent.invalidate_stale_memory()
     checkpoint = current_checkpoint(agent)
+    committed_action = latest_committed_action(agent)
     status = CHECKPOINT_NONE_STATUS
     stale_paths = list(invalidated)
     mismatch_fields = []
@@ -95,6 +131,14 @@ def evaluate_resume_state(agent):
         "status": status,
         "stale_paths": stale_paths,
         "runtime_identity_mismatch_fields": mismatch_fields,
+        "last_committed_action": {
+            "action_id": str(committed_action.get("action_id", "")),
+            "action_seq": int(committed_action.get("action_seq", 0) or 0),
+            "action_status": str(committed_action.get("action_status", "")),
+            "checkpoint_id": str(committed_action.get("checkpoint_id", "")),
+        }
+        if committed_action
+        else {},
         "stale_summary_invalidations": max(
             len(invalidated),
             int(previous_resume_state.get("stale_summary_invalidations", 0))
@@ -129,6 +173,12 @@ def render_checkpoint_text(agent):
     summary = str(checkpoint.get("summary", "")).strip()
     if summary:
         lines.append(f"- Summary: {summary}")
+    committed_action = agent.resume_state.get("last_committed_action", {})
+    if committed_action:
+        lines.append(
+            "- Last committed action: "
+            f"{committed_action.get('action_seq')} {committed_action.get('action_status')}"
+        )
     return "\n".join(lines)
 
 
@@ -142,7 +192,7 @@ def infer_next_step(task_state):
     return "Continue the task from the latest checkpoint."
 
 
-def create_checkpoint(agent, task_state, user_message, trigger):
+def create_checkpoint(agent, task_state, user_message, trigger, action_result=None):
     state = checkpoint_state(agent)
     current = current_checkpoint(agent)
     checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
@@ -152,6 +202,7 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         file_freshness = memorylib.file_freshness(path, agent.root)
         freshness[path] = file_freshness
         key_files.append({"path": path, "freshness": file_freshness})
+    action_completed = bool(action_result is not None and action_result.status == "completed")
     checkpoint = {
         "checkpoint_id": checkpoint_id,
         "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
@@ -166,6 +217,15 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         "freshness": freshness,
         "summary": f"{trigger}: {clip(str(user_message), 120)}",
         "runtime_identity": current_runtime_identity(agent),
+        "committed": action_completed,
+        "commit_status": (
+            "committed"
+            if action_completed
+            else ("not-committed" if action_result is not None else "not-applicable")
+        ),
+        "action_id": str(getattr(action_result, "action_id", "") or ""),
+        "action_seq": int(getattr(action_result, "action_seq", task_state.action_seq) or 0),
+        "action_status": str(getattr(action_result, "status", "") or ""),
     }
     state["items"][checkpoint_id] = checkpoint
     state["current_id"] = checkpoint_id
