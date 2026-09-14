@@ -1,7 +1,6 @@
 import hashlib
 import json
 import locale as locale_module
-import os
 import shlex
 import shutil
 import subprocess
@@ -215,22 +214,21 @@ def _artifact_path_for_task(task):
 
 def _run_verifier(command, cwd):
     """Run the fixed Python verifier form portably on Windows and POSIX."""
-    if os.name == "nt":
-        try:
-            argv = shlex.split(command)
-        except ValueError:
-            argv = []
-        if argv and Path(argv[0]).name.lower() in {"python", "python3", "py"} and "-c" in argv:
-            if Path(argv[0]).name.lower() == "py" and len(argv) > 1 and argv[1] == "-3":
-                argv.pop(1)
-            argv[0] = sys.executable
-            return subprocess.run(
-                argv,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = []
+    if argv and Path(argv[0]).name.lower() in {"python", "python3", "py"} and "-c" in argv:
+        if Path(argv[0]).name.lower() == "py" and len(argv) > 1 and argv[1] == "-3":
+            argv.pop(1)
+        argv[0] = sys.executable
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     return subprocess.run(
         command,
         cwd=cwd,
