@@ -1,8 +1,11 @@
 import hashlib
 import json
 import locale as locale_module
+import os
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from copy import deepcopy
 from datetime import datetime
@@ -208,6 +211,34 @@ def _artifact_path_for_task(task):
     if fixture_repo_name not in TASK_FIXTURE_ARTIFACTS:
         raise ValueError(f"unsupported fixture repo for artifact lookup: {fixture_repo_name}")
     return TASK_FIXTURE_ARTIFACTS[fixture_repo_name]
+
+
+def _run_verifier(command, cwd):
+    """Run the fixed Python verifier form portably on Windows and POSIX."""
+    if os.name == "nt":
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        if argv and Path(argv[0]).name.lower() in {"python", "python3", "py"} and "-c" in argv:
+            if Path(argv[0]).name.lower() == "py" and len(argv) > 1 and argv[1] == "-3":
+                argv.pop(1)
+            argv[0] = sys.executable
+            return subprocess.run(
+                argv,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def _workspace_relative(path, workspace_root):
@@ -567,13 +598,7 @@ class BenchmarkEvaluator:
         expected_artifact_exists = artifact_file.exists()
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
-        verifier = subprocess.run(
-            task["verifier"],
-            cwd=fixture_copy_root,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
+        verifier = _run_verifier(task["verifier"], fixture_copy_root)
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])
         verifier_passed = verifier.returncode == 0
@@ -628,6 +653,12 @@ class BenchmarkEvaluator:
             ),
             "auxiliary_requests": task_state.auxiliary_requests,
             "primitive_tool_calls": task_state.primitive_tool_calls,
+            "primitive_submissions": task_state.primitive_submissions,
+            "executed_tool_calls": task_state.executed_tool_calls,
+            "successful_tool_calls": task_state.successful_tool_calls,
+            "failed_tool_calls": task_state.failed_tool_calls,
+            "rejected_tool_calls": task_state.rejected_tool_calls,
+            "unknown_tool_calls": task_state.unknown_tool_calls,
             "chunk_count": task_state.chunk_count,
             "chunk_interrupt_rate": (
                 task_state.chunk_interrupts / task_state.chunk_count

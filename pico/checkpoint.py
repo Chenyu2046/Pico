@@ -79,7 +79,6 @@ def _is_complete_committed_action(item):
         return False
     checkpoint_id = str(item.get("checkpoint_id", "")).strip()
     action_id = str(item.get("action_id", "")).strip()
-    action_status = str(item.get("action_status", "")).strip()
     try:
         action_seq = int(item.get("action_seq", 0) or 0)
     except (TypeError, ValueError):
@@ -87,13 +86,36 @@ def _is_complete_committed_action(item):
     return bool(
         checkpoint_id
         and action_id
-        and action_status == "completed"
         and action_seq > 0
     )
 
 
+def reconcile_session_to_watermark(agent):
+    """Drop action-scoped history that is newer than the durable watermark."""
+    committed = latest_committed_action(agent)
+    watermark = int(committed.get("action_seq", 0) or 0) if committed else 0
+    history = list(agent.session.get("history", []))
+    kept = []
+    discarded = 0
+    for item in history:
+        try:
+            action_seq = int(item.get("action_seq", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            action_seq = 0
+        if item.get("action_id") and action_seq > watermark:
+            discarded += 1
+            continue
+        kept.append(item)
+    if discarded:
+        agent.session["history"] = kept
+    return discarded
+
+
 def evaluate_resume_state(agent):
     previous_resume_state = dict(agent.session.get("resume_state", {}) or {})
+    recovery_tail_discarded = reconcile_session_to_watermark(agent)
+    if not recovery_tail_discarded:
+        recovery_tail_discarded = int(previous_resume_state.get("recovery_tail_discarded", 0) or 0)
     invalidated = agent.invalidate_stale_memory()
     checkpoint = current_checkpoint(agent)
     committed_action = latest_committed_action(agent)
@@ -131,6 +153,7 @@ def evaluate_resume_state(agent):
         "status": status,
         "stale_paths": stale_paths,
         "runtime_identity_mismatch_fields": mismatch_fields,
+        "recovery_tail_discarded": recovery_tail_discarded,
         "last_committed_action": {
             "action_id": str(committed_action.get("action_id", "")),
             "action_seq": int(committed_action.get("action_seq", 0) or 0),
@@ -192,8 +215,7 @@ def infer_next_step(task_state):
     return "Continue the task from the latest checkpoint."
 
 
-def create_checkpoint(agent, task_state, user_message, trigger, action_result=None):
-    state = checkpoint_state(agent)
+def build_checkpoint(agent, task_state, user_message, trigger, action_result=None):
     current = current_checkpoint(agent)
     checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
     key_files = []
@@ -202,7 +224,11 @@ def create_checkpoint(agent, task_state, user_message, trigger, action_result=No
         file_freshness = memorylib.file_freshness(path, agent.root)
         freshness[path] = file_freshness
         key_files.append({"path": path, "freshness": file_freshness})
-    action_completed = bool(action_result is not None and action_result.status == "completed")
+    action_committed = bool(
+        action_result is not None
+        and action_result.result_known
+        and action_result.commit_eligible
+    )
     checkpoint = {
         "checkpoint_id": checkpoint_id,
         "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
@@ -217,19 +243,38 @@ def create_checkpoint(agent, task_state, user_message, trigger, action_result=No
         "freshness": freshness,
         "summary": f"{trigger}: {clip(str(user_message), 120)}",
         "runtime_identity": current_runtime_identity(agent),
-        "committed": action_completed,
+        "committed": action_committed,
         "commit_status": (
             "committed"
-            if action_completed
+            if action_committed
             else ("not-committed" if action_result is not None else "not-applicable")
         ),
         "action_id": str(getattr(action_result, "action_id", "") or ""),
         "action_seq": int(getattr(action_result, "action_seq", task_state.action_seq) or 0),
         "action_status": str(getattr(action_result, "status", "") or ""),
+        "result_known": bool(getattr(action_result, "result_known", True)) if action_result is not None else True,
+        "commit_eligible": bool(getattr(action_result, "commit_eligible", True)) if action_result is not None else True,
     }
-    state["items"][checkpoint_id] = checkpoint
-    state["current_id"] = checkpoint_id
-    task_state.checkpoint_id = checkpoint_id
+    return checkpoint
+
+
+def attach_checkpoint(agent, task_state, checkpoint):
+    state = checkpoint_state(agent)
+    state["items"][checkpoint["checkpoint_id"]] = checkpoint
+    state["current_id"] = checkpoint["checkpoint_id"]
+    task_state.checkpoint_id = checkpoint["checkpoint_id"]
     agent.session["runtime_identity"] = checkpoint["runtime_identity"]
+    return checkpoint
+
+
+def create_checkpoint(agent, task_state, user_message, trigger, action_result=None):
+    checkpoint = build_checkpoint(
+        agent,
+        task_state,
+        user_message,
+        trigger,
+        action_result=action_result,
+    )
+    attach_checkpoint(agent, task_state, checkpoint)
     agent.session_path = agent.session_store.save(agent.session)
     return checkpoint

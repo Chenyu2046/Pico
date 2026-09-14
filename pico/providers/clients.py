@@ -68,7 +68,10 @@ class FakeModelClient:
         logical_decision_id = kwargs.get("logical_decision_id")
         request_id = "request_" + uuid.uuid4().hex[:12]
         started_at = time.monotonic()
-        self.last_completion_metadata = {}
+        # Allow a specialized fake to seed completion metadata before calling
+        # super(), while keeping the base fake free of stale metadata.
+        seeded_metadata = self.last_completion_metadata if type(self).complete is not FakeModelClient.complete else {}
+        self.last_completion_metadata = dict(seeded_metadata or {})
         self.last_provider_attempts = []
         if not self.outputs:
             self.last_provider_attempts.append(

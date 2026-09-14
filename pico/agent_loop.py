@@ -3,14 +3,21 @@
 import inspect
 import time
 
-from .action_chunk import Action, BoundaryPolicy, ChunkExecutor, ChunkValidator, PrimitiveActionRunner
+from .action_chunk import (
+    Action,
+    BoundaryPolicy,
+    ChunkExecutor,
+    ChunkValidator,
+    PrimitiveActionRunner,
+    render_chunk_observation,
+)
 from .checkpoint import (
     CHECKPOINT_NONE_STATUS,
     CHECKPOINT_PARTIAL_STALE_STATUS,
     CHECKPOINT_WORKSPACE_MISMATCH_STATUS,
     latest_committed_action,
 )
-from .task_state import TaskState
+from .task_state import STOP_REASON_UNKNOWN_RESULT, TaskState
 from .workspace import clip, now
 
 
@@ -88,10 +95,18 @@ class AgentLoop:
             raw = agent.model_client.complete(prompt, agent.max_new_tokens, **complete_kwargs)
         except Exception as exc:
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
-            provider_metadata = self._provider_metadata(agent, logical_decision_id, status="error", error=exc)
+            provider_metadata = self._provider_metadata(
+                agent,
+                logical_decision_id,
+                status="error",
+                error=exc,
+                completion_metadata=completion_metadata,
+            )
             if completion_metadata:
+                prompt_metadata.update(provider_metadata)
                 prompt_metadata.update(completion_metadata)
-            prompt_metadata.update(provider_metadata)
+            else:
+                prompt_metadata.update(provider_metadata)
             agent.last_completion_metadata = completion_metadata
             agent.last_prompt_metadata = prompt_metadata
             attempts = self._provider_attempts(agent, provider_metadata, logical_decision_id)
@@ -102,10 +117,16 @@ class AgentLoop:
             self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
             raise
         completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
-        provider_metadata = self._provider_metadata(agent, logical_decision_id)
+        provider_metadata = self._provider_metadata(
+            agent,
+            logical_decision_id,
+            completion_metadata=completion_metadata,
+        )
         if completion_metadata:
+            prompt_metadata.update(provider_metadata)
             prompt_metadata.update(completion_metadata)
-        prompt_metadata.update(provider_metadata)
+        else:
+            prompt_metadata.update(provider_metadata)
         agent.last_completion_metadata = completion_metadata
         agent.last_prompt_metadata = prompt_metadata
         attempts = self._provider_attempts(agent, provider_metadata, logical_decision_id)
@@ -113,7 +134,7 @@ class AgentLoop:
         for attempt in attempts:
             agent.emit_trace(task_state, "provider_attempt", attempt)
         agent.emit_trace(task_state, "provider_response", provider_metadata)
-        kind, payload = agent.parse(raw)
+        kind, payload = agent.parse(raw, action_chunking=agent.action_chunking)
         agent.emit_trace(
             task_state,
             "model_parsed",
@@ -124,11 +145,19 @@ class AgentLoop:
                 "purpose": purpose,
             },
         )
+        discarded = int(agent.resume_state.get("recovery_tail_discarded", 0))
+        if discarded:
+            agent.emit_trace(
+                task_state,
+                "recovery_tail_discarded",
+                {"count": discarded},
+            )
         return raw, kind, payload
 
     @staticmethod
-    def _provider_metadata(agent, logical_decision_id, status="ok", error=""):
+    def _provider_metadata(agent, logical_decision_id, status="ok", error="", completion_metadata=None):
         metadata = dict(getattr(agent.model_client, "last_provider_metadata", {}) or {})
+        completion_metadata = dict(completion_metadata or {})
         metadata.setdefault("request_id", "")
         metadata.setdefault("attempt_id", 1)
         metadata["logical_decision_id"] = logical_decision_id
@@ -141,6 +170,8 @@ class AgentLoop:
             metadata["error"] = agent.redact_text(str(error))
         for key in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens"):
             metadata.setdefault(key, None)
+            if metadata[key] is None and completion_metadata.get(key) is not None:
+                metadata[key] = completion_metadata[key]
         metadata["usage_missing"] = all(metadata[key] is None for key in ("input_tokens", "output_tokens", "total_tokens"))
         return metadata
 
@@ -307,7 +338,29 @@ class AgentLoop:
             )
 
             if kind == "tool":
-                action_runner.run(Action.from_payload(payload), remaining_budget=agent.max_steps - task_state.tool_steps)
+                result = action_runner.run(
+                    Action.from_payload(payload),
+                    remaining_budget=agent.max_steps - task_state.tool_steps,
+                )
+                if not result.result_known:
+                    action = result.action
+                    if agent.tools.get(action.name, {}).get("risky", True):
+                        task_state.stop(
+                            STOP_REASON_UNKNOWN_RESULT,
+                            final_answer="Stopped because a potentially state-changing tool returned an unknown result.",
+                        )
+                        break
+                    agent.record(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "Runtime observation:\n"
+                                f"Action interrupted: {action.name} result is unknown.\n"
+                                "Replan using an independent read-only action."
+                            ),
+                            "created_at": now(),
+                        }
+                    )
                 pending_logical_decision_id = None
                 continue
 
@@ -316,7 +369,10 @@ class AgentLoop:
                     agent.record(
                         {
                             "role": "assistant",
-                            "content": agent.retry_notice("action chunks are disabled"),
+                            "content": agent.retry_notice(
+                                "action chunks are disabled",
+                                allow_chunk=False,
+                            ),
                             "created_at": now(),
                         }
                     )
@@ -342,6 +398,15 @@ class AgentLoop:
                 task_state.record_chunk(execution.summary)
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(task_state, "chunk_finished", execution.summary.to_dict())
+                observation = render_chunk_observation(execution.summary)
+                if observation:
+                    agent.record(
+                        {
+                            "role": "assistant",
+                            "content": observation,
+                            "created_at": now(),
+                        }
+                    )
                 pending_logical_decision_id = None
                 continue
 
@@ -390,7 +455,9 @@ class AgentLoop:
                 final = (payload or raw).strip()
                 return self._finish_success(task_state, user_message, final, run_started_at)
 
-        if task_state.attempts >= max_attempts and task_state.tool_steps < agent.max_steps:
+        if task_state.stop_reason == STOP_REASON_UNKNOWN_RESULT:
+            final = task_state.final_answer
+        elif task_state.attempts >= max_attempts and task_state.tool_steps < agent.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
         else:

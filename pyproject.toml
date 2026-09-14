@@ -16,6 +16,7 @@ pico = "pico.cli:main"
 dev = [
   "pytest>=8.3.5",
   "ruff>=0.4.4",
+  "tzdata>=2024.1",
 ]
 
 [tool.setuptools.packages.find]

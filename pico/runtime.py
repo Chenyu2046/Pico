@@ -23,7 +23,7 @@ from .run_store import RunStore
 from .security import REDACTED_VALUE
 from .session_store import SessionStore
 from .tool_context import ToolContext
-from .tool_executor import ToolExecutor
+from .tool_executor import ToolExecutionResult, ToolExecutor
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
@@ -278,9 +278,10 @@ class Pico:
         prompt, _ = self._build_prompt_and_metadata(user_message)
         return prompt
 
-    def record(self, item):
+    def record(self, item, persist=True):
         self.session["history"].append(item)
-        self.session_path = self.session_store.save(self.session)
+        if persist:
+            self.session_path = self.session_store.save(self.session)
 
     @staticmethod
     def looks_sensitive_env_name(name):
@@ -341,6 +342,7 @@ class Pico:
                 "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
                 "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
+                "recovery_tail_discarded": int(self.resume_state.get("recovery_tail_discarded", 0)),
             }
         )
         metadata.update(self.detected_secret_env_summary())
@@ -396,6 +398,18 @@ class Pico:
             trigger,
             action_result=action_result,
         )
+
+    def build_checkpoint(self, task_state, user_message, trigger, action_result=None):
+        return checkpointlib.build_checkpoint(
+            self,
+            task_state,
+            user_message,
+            trigger,
+            action_result=action_result,
+        )
+
+    def attach_checkpoint(self, task_state, checkpoint):
+        return checkpointlib.attach_checkpoint(self, task_state, checkpoint)
 
     def infer_next_step(self, task_state):
         return checkpointlib.infer_next_step(task_state)
@@ -524,6 +538,17 @@ class Pico:
         self._last_tool_result_metadata = dict(result.metadata)
         return result
 
+    def tool_result_for_unknown_action(self, name, exc):
+        return ToolExecutionResult(
+            content=f"error: tool {name} execution result is unknown: {self.redact_text(str(exc))}",
+            metadata={
+                "tool_status": "error",
+                "tool_error_code": "unknown_result",
+                "process_crash_or_unknown_result": True,
+                "result_known": False,
+            },
+        )
+
     def run_tool(self, name, args):
         """执行一次工具调用，并在执行前后套上完整护栏。
 
@@ -543,7 +568,16 @@ class Pico:
         工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
         是否需要回写记忆。
         """
-        return self.execute_tool(name, args).content
+        result = self.execute_tool(name, args)
+        if (
+            result.metadata.get("tool_status") != "rejected"
+            and not result.metadata.get("process_crash_or_unknown_result")
+        ):
+            self.update_memory_after_tool(name, args, result.content)
+            self.record_process_note_for_tool(name, result.metadata)
+            self.session["memory"] = self.memory.to_dict()
+            self.session_path = self.session_store.save(self.session)
+        return result.content
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
@@ -596,6 +630,12 @@ class Pico:
                 ),
                 "auxiliary_requests": task_state.auxiliary_requests,
                 "primitive_tool_calls": task_state.primitive_tool_calls,
+                "primitive_submissions": task_state.primitive_submissions,
+                "executed_tool_calls": task_state.executed_tool_calls,
+                "successful_tool_calls": task_state.successful_tool_calls,
+                "failed_tool_calls": task_state.failed_tool_calls,
+                "rejected_tool_calls": task_state.rejected_tool_calls,
+                "unknown_tool_calls": task_state.unknown_tool_calls,
                 "chunk_count": task_state.chunk_count,
                 "chunk_interrupt_rate": (
                     task_state.chunk_interrupts / task_state.chunk_count
@@ -680,7 +720,7 @@ class Pico:
         return answer.strip().lower() in {"y", "yes"}
 
     @staticmethod
-    def parse(raw):
+    def parse(raw, action_chunking=None):
         """把模型原始输出解析成 runtime 可执行的动作或最终答案。
 
         为什么存在：
@@ -698,6 +738,7 @@ class Pico:
         """
         raw = str(raw)
         stripped = raw.strip()
+        allow_chunk = bool(action_chunking and action_chunking.get("enabled"))
         if stripped.startswith("{"):
             try:
                 structured = json.loads(stripped)
@@ -709,10 +750,16 @@ class Pico:
                     structured["skill_id"] = structured.pop("skill")
                 if kind == "final":
                     final = str(structured.get("content", structured.get("text", ""))).strip()
-                    return ("final", final) if final else ("retry", Pico.retry_notice("model returned an empty final answer"))
+                    return ("final", final) if final else (
+                        "retry",
+                        Pico.retry_notice("model returned an empty final answer", allow_chunk=allow_chunk),
+                    )
                 if kind == "tool":
                     if not str(structured.get("name", "")).strip():
-                        return "retry", Pico.retry_notice("tool payload is missing a tool name")
+                        return "retry", Pico.retry_notice(
+                            "tool payload is missing a tool name",
+                            allow_chunk=allow_chunk,
+                        )
                     if structured.get("args") is None:
                         structured["args"] = {}
                 return kind, structured
@@ -721,9 +768,15 @@ class Pico:
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Pico.retry_notice("model returned malformed chunk JSON")
+                return "retry", Pico.retry_notice(
+                    "model returned malformed chunk JSON",
+                    allow_chunk=allow_chunk,
+                )
             if not isinstance(payload, dict):
-                return "retry", Pico.retry_notice("chunk payload must be a JSON object")
+                return "retry", Pico.retry_notice(
+                    "chunk payload must be a JSON object",
+                    allow_chunk=allow_chunk,
+                )
             if "skill" in payload and "skill_id" not in payload:
                 payload["skill_id"] = payload.pop("skill")
             return "chunk", payload
@@ -735,41 +788,63 @@ class Pico:
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Pico.retry_notice("model returned malformed tool JSON")
+                return "retry", Pico.retry_notice(
+                    "model returned malformed tool JSON",
+                    allow_chunk=allow_chunk,
+                )
             if not isinstance(payload, dict):
-                return "retry", Pico.retry_notice("tool payload must be a JSON object")
+                return "retry", Pico.retry_notice(
+                    "tool payload must be a JSON object",
+                    allow_chunk=allow_chunk,
+                )
             if not str(payload.get("name", "")).strip():
-                return "retry", Pico.retry_notice("tool payload is missing a tool name")
+                return "retry", Pico.retry_notice(
+                    "tool payload is missing a tool name",
+                    allow_chunk=allow_chunk,
+                )
             args = payload.get("args", {})
             if args is None:
                 payload["args"] = {}
             elif not isinstance(args, dict):
-                return "retry", Pico.retry_notice()
+                return "retry", Pico.retry_notice(
+                    allow_chunk=allow_chunk,
+                )
             return "tool", payload
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
                 return "tool", payload
-            return "retry", Pico.retry_notice()
+            return "retry", Pico.retry_notice(
+                allow_chunk=allow_chunk,
+            )
         if "<final>" in raw:
             final = Pico.extract(raw, "final").strip()
             if final:
                 return "final", final
-            return "retry", Pico.retry_notice("model returned an empty <final> answer")
+            return "retry", Pico.retry_notice(
+                "model returned an empty <final> answer",
+                allow_chunk=allow_chunk,
+            )
         raw = raw.strip()
         if raw:
             return "final", raw
-        return "retry", Pico.retry_notice("model returned an empty response")
+        return "retry", Pico.retry_notice(
+            "model returned an empty response",
+            allow_chunk=allow_chunk,
+        )
 
     @staticmethod
-    def retry_notice(problem=None):
+    def retry_notice(problem=None, allow_chunk=False):
         prefix = "Runtime notice"
         if problem:
             prefix += f": {problem}"
         else:
             prefix += ": model returned malformed tool output"
+        allowed = "a valid <tool> call"
+        if allow_chunk:
+            allowed += ", a valid <chunk> call"
         return (
-            f"{prefix}. Reply with a valid <tool> call, a valid <chunk> call, or a non-empty <final> answer. "
+            f"{prefix}. Reply with {allowed}, or a non-empty <final> answer. "
             'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
         )
 

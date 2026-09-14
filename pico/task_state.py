@@ -22,6 +22,7 @@ STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+STOP_REASON_UNKNOWN_RESULT = "unknown_tool_result"
 
 
 @dataclass
@@ -45,6 +46,12 @@ class TaskState:
     usage_missing_responses: int = 0
     auxiliary_requests: int = 0
     primitive_tool_calls: int = 0
+    primitive_submissions: int = 0
+    executed_tool_calls: int = 0
+    successful_tool_calls: int = 0
+    failed_tool_calls: int = 0
+    rejected_tool_calls: int = 0
+    unknown_tool_calls: int = 0
     action_seq: int = 0
     chunk_count: int = 0
     chunk_interrupts: int = 0
@@ -79,6 +86,12 @@ class TaskState:
             usage_missing_responses=int(data.get("usage_missing_responses", 0)),
             auxiliary_requests=int(data.get("auxiliary_requests", 0)),
             primitive_tool_calls=int(data.get("primitive_tool_calls", data.get("tool_steps", 0))),
+            primitive_submissions=int(data.get("primitive_submissions", data.get("tool_steps", 0))),
+            executed_tool_calls=int(data.get("executed_tool_calls", 0)),
+            successful_tool_calls=int(data.get("successful_tool_calls", 0)),
+            failed_tool_calls=int(data.get("failed_tool_calls", 0)),
+            rejected_tool_calls=int(data.get("rejected_tool_calls", 0)),
+            unknown_tool_calls=int(data.get("unknown_tool_calls", 0)),
             action_seq=int(data.get("action_seq", 0)),
             chunk_count=int(data.get("chunk_count", 0)),
             chunk_interrupts=int(data.get("chunk_interrupts", 0)),
@@ -104,10 +117,21 @@ class TaskState:
             self.provider_attempts.extend(dict(attempt) for attempt in attempts)
         return self
 
-    def record_tool(self, name):
-        # tool_steps 只统计真正进入执行阶段的工具调用次数。
+    def record_tool(self, name, status="completed", executed=True, result_known=True):
+        # tool_steps 统计 primitive submission，而不是成功执行次数。
         self.tool_steps += 1
         self.primitive_tool_calls += 1
+        self.primitive_submissions += 1
+        if executed:
+            self.executed_tool_calls += 1
+        if not result_known:
+            self.unknown_tool_calls += 1
+        elif status == "completed":
+            self.successful_tool_calls += 1
+        elif status == "failed":
+            self.failed_tool_calls += 1
+        elif status == "rejected":
+            self.rejected_tool_calls += 1
         self.last_tool = str(name or "")
         return self
 
@@ -168,6 +192,12 @@ class TaskState:
             "usage_missing_responses": self.usage_missing_responses,
             "auxiliary_requests": self.auxiliary_requests,
             "primitive_tool_calls": self.primitive_tool_calls,
+            "primitive_submissions": self.primitive_submissions,
+            "executed_tool_calls": self.executed_tool_calls,
+            "successful_tool_calls": self.successful_tool_calls,
+            "failed_tool_calls": self.failed_tool_calls,
+            "rejected_tool_calls": self.rejected_tool_calls,
+            "unknown_tool_calls": self.unknown_tool_calls,
             "action_seq": self.action_seq,
             "chunk_count": self.chunk_count,
             "chunk_interrupts": self.chunk_interrupts,

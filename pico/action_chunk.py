@@ -7,7 +7,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from .workspace import clip, now
+from . import checkpoint as checkpointlib
+from .action_commit import ActionCommitter
+from .workspace import clip
 
 
 READ_ONLY_CHUNK_TOOLS = ("list_files", "read_file", "search")
@@ -15,7 +17,7 @@ ACTION_STATUSES = ("planned", "accepted", "rejected", "started", "completed", "f
 ACTION_TRANSITIONS = {
     "planned": {"accepted", "rejected"},
     "accepted": {"started", "rejected"},
-    "started": {"completed", "failed", "interrupted"},
+    "started": {"completed", "failed", "rejected", "interrupted"},
     "rejected": set(),
     "completed": set(),
     "failed": set(),
@@ -179,6 +181,8 @@ class ActionResult:
     metadata: dict
     checkpoint_id: str = ""
     executed: bool = False
+    result_known: bool = True
+    commit_eligible: bool = True
 
 
 @dataclass
@@ -222,6 +226,25 @@ class ChunkSummary:
             "chunk_length": self.chunk_length,
             "error": self.error,
         }
+
+
+def render_chunk_observation(summary):
+    if summary.terminal_status == "completed":
+        return ""
+    if summary.terminal_status == "rejected":
+        prefix = "Action chunk rejected."
+    else:
+        prefix = (
+            f"Action chunk interrupted after {summary.started_actions}/"
+            f"{summary.planned_actions} actions."
+        )
+    detail = summary.error or summary.stop_reason or "unknown boundary"
+    return (
+        "Runtime observation:\n"
+        f"{prefix}\n"
+        f"Reason: {detail}.\n"
+        "Replan using independent read-only actions."
+    )
 
 
 @dataclass(frozen=True)
@@ -369,7 +392,15 @@ class BoundaryPolicy:
                 return reason
         return "hard_boundary"
 
-    def after_action(self, result, observation_chars, *, boundary_hint=False, budget_remaining=True):
+    def after_action(
+        self,
+        result,
+        observation_chars,
+        *,
+        boundary_hint=False,
+        has_unstarted_actions=False,
+        primitive_budget_exhausted=False,
+    ):
         reasons = []
         if result.status == "failed":
             reasons.append("tool_failed")
@@ -383,7 +414,7 @@ class BoundaryPolicy:
             reasons.append("hard_boundary")
         if self.skill_guidance_enabled and boundary_hint and result.status == "completed":
             reasons.append("skill_boundary")
-        if not budget_remaining:
+        if primitive_budget_exhausted and has_unstarted_actions:
             reasons.append("budget_exhausted")
         return self.select_stop_reason(reasons) if reasons else ""
 
@@ -395,6 +426,7 @@ class PrimitiveActionRunner:
         self.agent = agent
         self.task_state = task_state
         self.user_message = str(user_message)
+        self.committer = ActionCommitter(agent)
 
     def run(self, action, remaining_budget=None):
         if remaining_budget is not None and int(remaining_budget) <= 0:
@@ -423,14 +455,25 @@ class PrimitiveActionRunner:
             },
         )
         started_at = time.monotonic()
-        tool_result = self.agent.execute_tool(action.name, action.args)
+        try:
+            tool_result = self.agent.execute_tool(action.name, action.args)
+        except Exception as exc:
+            tool_result = self.agent.tool_result_for_unknown_action(action.name, exc)
         metadata = dict(tool_result.metadata or {})
         tool_status = str(metadata.get("tool_status", "ok"))
+        result_known_value = metadata.get("result_known")
+        result_known = (
+            bool(result_known_value)
+            if result_known_value is not None
+            else not bool(metadata.get("process_crash_or_unknown_result"))
+        )
         if tool_status == "rejected":
+            status = "rejected"
+            executed = False
+            lifecycle.transition("rejected")
+        elif not result_known:
             status = "interrupted"
             executed = False
-            # ToolExecutor was already entered, so a late rejection cannot use
-            # the planned -> rejected edge. It is an interrupted submission.
             lifecycle.transition("interrupted")
         else:
             status = "completed" if tool_status == "ok" else "failed"
@@ -438,7 +481,7 @@ class PrimitiveActionRunner:
             lifecycle.transition(status)
         # Every call that enters ToolExecutor consumes exactly one primitive
         # budget step, including a late pre-execution rejection.
-        self.task_state.record_tool(action.name)
+        self.task_state.record_tool(action.name, status=status, executed=executed, result_known=result_known)
         result = ActionResult(
             action_id=action_id,
             action_seq=action_seq,
@@ -447,19 +490,13 @@ class PrimitiveActionRunner:
             content=tool_result.content,
             metadata=metadata,
             executed=executed,
+            result_known=result_known,
+            commit_eligible=result_known and bool(metadata.get("commit_eligible", True)),
         )
-        self.agent.record(
-            {
-                "role": "tool",
-                "name": action.name,
-                "args": action.args,
-                "content": tool_result.content,
-                "created_at": now(),
-                "action_id": action_id,
-                "action_seq": action_seq,
-                "action_status": status,
-            }
-        )
+        if not result_known and not self.agent.tools.get(action.name, {}).get("risky", True):
+            committed = checkpointlib.latest_committed_action(self.agent)
+            self.task_state.action_seq = int(committed.get("action_seq", 0) or 0) if committed else 0
+        checkpoint = self.committer.commit(self.task_state, result, self.user_message)
         self.agent.run_store.write_task_state(self.task_state)
         self.agent.emit_trace(
             self.task_state,
@@ -475,24 +512,18 @@ class PrimitiveActionRunner:
                 **metadata,
             },
         )
-        checkpoint = self.agent.create_checkpoint(
-            self.task_state,
-            self.user_message,
-            trigger="action_committed",
-            action_result=result,
-        )
-        self.agent.run_store.write_task_state(self.task_state)
-        self.agent.emit_trace(
-            self.task_state,
-            "checkpoint_created",
-            {
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "trigger": "action_committed",
-                "action_id": action_id,
-                "action_seq": action_seq,
-                "action_status": status,
-            },
-        )
+        if checkpoint:
+            self.agent.emit_trace(
+                self.task_state,
+                "checkpoint_created",
+                {
+                    "checkpoint_id": checkpoint["checkpoint_id"],
+                    "trigger": "action_committed",
+                    "action_id": action_id,
+                    "action_seq": action_seq,
+                    "action_status": status,
+                },
+            )
         return ActionResult(
             action_id=result.action_id,
             action_seq=result.action_seq,
@@ -500,8 +531,10 @@ class PrimitiveActionRunner:
             status=result.status,
             content=result.content,
             metadata=result.metadata,
-            checkpoint_id=checkpoint["checkpoint_id"],
+            checkpoint_id=checkpoint["checkpoint_id"] if checkpoint else "",
             executed=result.executed,
+            result_known=result.result_known,
+            commit_eligible=result.commit_eligible,
         )
 
 
@@ -513,7 +546,7 @@ class ChunkExecutor:
 
     def run(self, payload, remaining_budget):
         validation = self.validator.validate(payload, remaining_budget=remaining_budget)
-        if validation.chunk is None or validation.rejected_actions:
+        if validation.chunk is None or validation.rejected_actions or validation.error:
             summary = ChunkSummary(
                 chunk_id=(
                     validation.chunk.chunk_id
@@ -564,7 +597,12 @@ class ChunkExecutor:
                 result,
                 observation_chars,
                 boundary_hint=action.boundary_hint or (chunk.boundary_hint and is_last_accepted),
-                budget_remaining=(summary.started_actions < int(remaining_budget)),
+                has_unstarted_actions=(
+                    not is_last_accepted or validation.remaining_actions > 0
+                ),
+                primitive_budget_exhausted=(
+                    summary.started_actions >= int(remaining_budget)
+                ),
             )
             if stop_reason:
                 summary.stop_reason = stop_reason
