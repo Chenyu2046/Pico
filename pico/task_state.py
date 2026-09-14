@@ -23,6 +23,7 @@ STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
 STOP_REASON_UNKNOWN_RESULT = "unknown_tool_result"
+STOP_REASON_ACTION_SEQUENCE_MISMATCH = "action_sequence_mismatch"
 
 
 @dataclass

@@ -11,13 +11,18 @@ from .action_chunk import (
     PrimitiveActionRunner,
     render_chunk_observation,
 )
+from .action_commit import ActionCommitSequenceError
 from .checkpoint import (
     CHECKPOINT_NONE_STATUS,
     CHECKPOINT_PARTIAL_STALE_STATUS,
     CHECKPOINT_WORKSPACE_MISMATCH_STATUS,
     latest_committed_action,
 )
-from .task_state import STOP_REASON_UNKNOWN_RESULT, TaskState
+from .task_state import (
+    STOP_REASON_ACTION_SEQUENCE_MISMATCH,
+    STOP_REASON_UNKNOWN_RESULT,
+    TaskState,
+)
 from .workspace import clip, now
 
 
@@ -145,13 +150,6 @@ class AgentLoop:
                 "purpose": purpose,
             },
         )
-        discarded = int(agent.resume_state.get("recovery_tail_discarded", 0))
-        if discarded:
-            agent.emit_trace(
-                task_state,
-                "recovery_tail_discarded",
-                {"count": discarded},
-            )
         return raw, kind, payload
 
     @staticmethod
@@ -241,6 +239,12 @@ class AgentLoop:
     def run(self, user_message):
         agent = self.agent
         run_started_at = time.monotonic()
+        recovery_tail_discarded = int(agent.resume_state.get("recovery_tail_discarded", 0) or 0)
+        recovery_tail_discarded_cumulative = int(
+            agent.resume_state.get("recovery_tail_discarded_cumulative", recovery_tail_discarded) or 0
+        )
+        agent.resume_state["recovery_tail_discarded"] = 0
+        agent.session["resume_state"] = agent.resume_state
         agent.memory.set_task_summary(user_message)
         agent.record({"role": "user", "content": user_message, "created_at": now()})
 
@@ -259,6 +263,15 @@ class AgentLoop:
                 "user_request": clip(user_message, 300),
             },
         )
+        if recovery_tail_discarded_cumulative:
+            agent.emit_trace(
+                task_state,
+                "recovery_tail_discarded",
+                {
+                    "new_count": recovery_tail_discarded,
+                    "cumulative_count": recovery_tail_discarded_cumulative,
+                },
+            )
 
         max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
         action_runner = PrimitiveActionRunner(agent, task_state, user_message)
@@ -338,10 +351,27 @@ class AgentLoop:
             )
 
             if kind == "tool":
-                result = action_runner.run(
-                    Action.from_payload(payload),
-                    remaining_budget=agent.max_steps - task_state.tool_steps,
-                )
+                try:
+                    result = action_runner.run(
+                        Action.from_payload(payload),
+                        remaining_budget=agent.max_steps - task_state.tool_steps,
+                    )
+                except ActionCommitSequenceError as exc:
+                    task_state.stop(
+                        STOP_REASON_ACTION_SEQUENCE_MISMATCH,
+                        final_answer="Stopped because the action commit sequence invariant was violated.",
+                    )
+                    agent.emit_trace(
+                        task_state,
+                        "action_sequence_mismatch",
+                        {
+                            "action_seq": exc.action_seq,
+                            "watermark": exc.watermark,
+                            "expected_action_seq": exc.watermark + 1,
+                            "error": str(exc),
+                        },
+                    )
+                    break
                 if not result.result_known:
                     action = result.action
                     if agent.tools.get(action.name, {}).get("risky", True):
@@ -384,17 +414,56 @@ class AgentLoop:
                     allowed_tools=agent.action_chunking["allowed_tools"],
                     max_actions_per_chunk=agent.action_chunking["max_actions_per_chunk"],
                 )
-                execution = ChunkExecutor(
-                    runner=action_runner,
-                    validator=validator,
-                    boundary_policy=BoundaryPolicy(
-                        agent.action_chunking["observation_budget_chars"],
-                        skill_guidance_enabled=agent.action_chunking["skill_guidance_enabled"],
-                    ),
-                ).run(
-                    payload,
-                    remaining_budget=agent.max_steps - task_state.tool_steps,
-                )
+                try:
+                    execution = ChunkExecutor(
+                        runner=action_runner,
+                        validator=validator,
+                        boundary_policy=BoundaryPolicy(
+                            agent.action_chunking["observation_budget_chars"],
+                            skill_guidance_enabled=agent.action_chunking["skill_guidance_enabled"],
+                        ),
+                    ).run(
+                        payload,
+                        remaining_budget=agent.max_steps - task_state.tool_steps,
+                    )
+                except ActionCommitSequenceError as exc:
+                    action_result = exc.action_result
+                    action_status = action_result.status if action_result else "interrupted"
+                    task_state.record_chunk(
+                        {
+                            "chunk_id": str(payload.get("chunk_id", "")) if isinstance(payload, dict) else "",
+                            "skill_id": payload.get("skill_id") if isinstance(payload, dict) else None,
+                            "planned_actions": len(payload.get("actions", [])) if isinstance(payload, dict) else 0,
+                            "accepted_actions": 1,
+                            "started_actions": 1,
+                            "executed_actions": int(bool(action_result and action_result.executed)),
+                            "completed_actions": int(action_status == "completed"),
+                            "failed_actions": int(action_status == "failed"),
+                            "rejected_actions": int(action_status == "rejected"),
+                            "remaining_actions": max(
+                                0,
+                                len(payload.get("actions", [])) - 1,
+                            ) if isinstance(payload, dict) else 0,
+                            "terminal_status": "interrupted",
+                            "stop_reason": STOP_REASON_ACTION_SEQUENCE_MISMATCH,
+                            "error": str(exc),
+                        }
+                    )
+                    task_state.stop(
+                        STOP_REASON_ACTION_SEQUENCE_MISMATCH,
+                        final_answer="Stopped because the action commit sequence invariant was violated.",
+                    )
+                    agent.emit_trace(
+                        task_state,
+                        "action_sequence_mismatch",
+                        {
+                            "action_seq": exc.action_seq,
+                            "watermark": exc.watermark,
+                            "expected_action_seq": exc.watermark + 1,
+                            "error": str(exc),
+                        },
+                    )
+                    break
                 task_state.record_chunk(execution.summary)
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(task_state, "chunk_finished", execution.summary.to_dict())
@@ -420,7 +489,10 @@ class AgentLoop:
             final = (payload or raw).strip()
             return self._finish_success(task_state, user_message, final, run_started_at)
 
-        if task_state.tool_steps >= agent.max_steps:
+        if task_state.tool_steps >= agent.max_steps and task_state.stop_reason not in {
+            STOP_REASON_UNKNOWN_RESULT,
+            STOP_REASON_ACTION_SEQUENCE_MISMATCH,
+        }:
             task_state.record_attempt()
             logical_decision_id = f"decision_{task_state.logical_decisions + 1}"
             task_state.record_logical_decision()
@@ -455,7 +527,10 @@ class AgentLoop:
                 final = (payload or raw).strip()
                 return self._finish_success(task_state, user_message, final, run_started_at)
 
-        if task_state.stop_reason == STOP_REASON_UNKNOWN_RESULT:
+        if task_state.stop_reason in {
+            STOP_REASON_UNKNOWN_RESULT,
+            STOP_REASON_ACTION_SEQUENCE_MISMATCH,
+        }:
             final = task_state.final_answer
         elif task_state.attempts >= max_attempts and task_state.tool_steps < agent.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."

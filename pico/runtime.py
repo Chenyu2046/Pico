@@ -343,6 +343,9 @@ class Pico:
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
                 "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
                 "recovery_tail_discarded": int(self.resume_state.get("recovery_tail_discarded", 0)),
+                "recovery_tail_discarded_cumulative": int(
+                    self.resume_state.get("recovery_tail_discarded_cumulative", 0)
+                ),
             }
         )
         metadata.update(self.detected_secret_env_summary())
@@ -569,13 +572,13 @@ class Pico:
         是否需要回写记忆。
         """
         result = self.execute_tool(name, args)
-        if (
-            result.metadata.get("tool_status") != "rejected"
-            and not result.metadata.get("process_crash_or_unknown_result")
-        ):
+        tool_status = str(result.metadata.get("tool_status", "")).strip()
+        if tool_status == "ok" and not result.metadata.get("process_crash_or_unknown_result"):
             self.update_memory_after_tool(name, args, result.content)
-            self.record_process_note_for_tool(name, result.metadata)
             self.session["memory"] = self.memory.to_dict()
+            self.session_path = self.session_store.save(self.session)
+        elif tool_status in {"partial_success", "error", "rejected"}:
+            self.record_process_note_for_tool(name, result.metadata)
             self.session_path = self.session_store.save(self.session)
         return result.content
 

@@ -91,31 +91,92 @@ def _is_complete_committed_action(item):
 
 
 def reconcile_session_to_watermark(agent):
-    """Drop action-scoped history that is newer than the durable watermark."""
+    """Reconcile action history, checkpoints, and current_id to the watermark."""
     committed = latest_committed_action(agent)
     watermark = int(committed.get("action_seq", 0) or 0) if committed else 0
+
+    discarded_actions = set()
     history = list(agent.session.get("history", []))
     kept = []
-    discarded = 0
     for item in history:
         try:
             action_seq = int(item.get("action_seq", 0) or 0)
         except (AttributeError, TypeError, ValueError):
             action_seq = 0
         if item.get("action_id") and action_seq > watermark:
-            discarded += 1
+            discarded_actions.add((str(item.get("action_id")), action_seq))
             continue
         kept.append(item)
-    if discarded:
+    if len(kept) != len(history):
         agent.session["history"] = kept
-    return discarded
+
+    checkpoints = checkpoint_state(agent)
+    items = dict(checkpoints.get("items", {}))
+    current_id = str(checkpoints.get("current_id", "")).strip()
+    current = items.get(current_id)
+    for checkpoint_id, item in list(items.items()):
+        if not isinstance(item, dict) or not item.get("action_id"):
+            continue
+        try:
+            action_seq = int(item.get("action_seq", 0) or 0)
+        except (TypeError, ValueError):
+            action_seq = 0
+        if action_seq > watermark and not _is_complete_committed_action(item):
+            discarded_actions.add((str(item.get("action_id")), action_seq))
+            items.pop(checkpoint_id, None)
+    checkpoints["items"] = items
+
+    def legal_checkpoint(checkpoint):
+        if not isinstance(checkpoint, dict):
+            return False
+        if not checkpoint.get("action_id"):
+            return True
+        try:
+            action_seq = int(checkpoint.get("action_seq", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return action_seq <= watermark and _is_complete_committed_action(checkpoint)
+
+    if not legal_checkpoint(items.get(current_id)):
+        fallback_id = str(current.get("parent_checkpoint_id", "")).strip() if current else ""
+        seen = set()
+        while fallback_id and fallback_id not in seen:
+            seen.add(fallback_id)
+            candidate = items.get(fallback_id)
+            if legal_checkpoint(candidate):
+                break
+            fallback_id = str(candidate.get("parent_checkpoint_id", "")).strip() if candidate else ""
+        else:
+            fallback_id = ""
+        if not fallback_id:
+            legal_ids = [
+                checkpoint_id
+                for checkpoint_id, item in items.items()
+                if legal_checkpoint(item)
+            ]
+            fallback_id = next(
+                (
+                    checkpoint_id
+                    for checkpoint_id in reversed(legal_ids)
+                    if _is_complete_committed_action(items[checkpoint_id])
+                ),
+                legal_ids[-1] if legal_ids else "",
+            )
+        checkpoints["current_id"] = fallback_id
+
+    return len(discarded_actions)
 
 
 def evaluate_resume_state(agent):
     previous_resume_state = dict(agent.session.get("resume_state", {}) or {})
     recovery_tail_discarded = reconcile_session_to_watermark(agent)
-    if not recovery_tail_discarded:
-        recovery_tail_discarded = int(previous_resume_state.get("recovery_tail_discarded", 0) or 0)
+    recovery_tail_discarded_cumulative = int(
+        previous_resume_state.get(
+            "recovery_tail_discarded_cumulative",
+            previous_resume_state.get("recovery_tail_discarded", 0),
+        )
+        or 0
+    ) + recovery_tail_discarded
     invalidated = agent.invalidate_stale_memory()
     checkpoint = current_checkpoint(agent)
     committed_action = latest_committed_action(agent)
@@ -154,6 +215,7 @@ def evaluate_resume_state(agent):
         "stale_paths": stale_paths,
         "runtime_identity_mismatch_fields": mismatch_fields,
         "recovery_tail_discarded": recovery_tail_discarded,
+        "recovery_tail_discarded_cumulative": recovery_tail_discarded_cumulative,
         "last_committed_action": {
             "action_id": str(committed_action.get("action_id", "")),
             "action_seq": int(committed_action.get("action_seq", 0) or 0),
