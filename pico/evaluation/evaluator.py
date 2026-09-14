@@ -6,16 +6,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ..features import memory as memorylib
 from ..action_chunk import normalize_action_chunking
+from ..features import memory as memorylib
 from ..providers.clients import FakeModelClient
-from ..runtime import Pico, SessionStore
 from ..run_store import RunStore
+from ..runtime import Pico, SessionStore
 from ..task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from ..tools import legal_tool_names
 from ..workspace import WorkspaceContext
@@ -206,6 +207,8 @@ def _now_in_timezone(timezone_name):
 
 
 def _artifact_path_for_task(task):
+    if task.get("artifact_path"):
+        return str(task["artifact_path"])
     fixture_repo_name = Path(str(task["fixture_repo"])).name
     if fixture_repo_name not in TASK_FIXTURE_ARTIFACTS:
         raise ValueError(f"unsupported fixture repo for artifact lookup: {fixture_repo_name}")
@@ -252,8 +255,17 @@ def _scripted_outputs_for_task(task):
 
 def _fixture_snapshot_id(fixture_paths):
     sha = hashlib.sha256()
+    ignored_parts = {".pico", "__pycache__"}
     for fixture_path in sorted({Path(path).resolve() for path in fixture_paths}, key=lambda path: str(path)):
-        for path in sorted((item for item in fixture_path.rglob("*") if item.is_file()), key=lambda item: str(item.relative_to(fixture_path))):
+        for path in sorted(
+            (
+                item
+                for item in fixture_path.rglob("*")
+                if item.is_file()
+                and not ignored_parts.intersection(item.relative_to(fixture_path).parts)
+            ),
+            key=lambda item: str(item.relative_to(fixture_path)),
+        ):
             sha.update(str(fixture_path.name).encode("utf-8"))
             sha.update(b"\0")
             sha.update(str(path.relative_to(fixture_path)).encode("utf-8"))
@@ -508,9 +520,58 @@ class BenchmarkEvaluator:
     def load(self):
         return load_benchmark(self.benchmark_path, repo_root=self.repo_root)
 
-    def run(self):
+    def run(self, task_ids=None, continue_on_error=False):
         benchmark = self.load()
-        rows = [self.run_task(task) for task in benchmark["tasks"]]
+        tasks = benchmark["tasks"]
+        if task_ids is not None:
+            requested = [str(task_id) for task_id in task_ids]
+            requested_set = set(requested)
+            known = {task["id"] for task in tasks}
+            unknown = sorted(requested_set - known)
+            if unknown:
+                raise ValueError("unknown benchmark task ids: " + ", ".join(unknown))
+            tasks = [task for task in tasks if task["id"] in requested_set]
+        rows = []
+        for task in tasks:
+            try:
+                rows.append(self.run_task(task))
+            except Exception as exc:
+                if not continue_on_error:
+                    raise
+                rows.append(
+                    {
+                        "id": task["id"],
+                        "category": task["category"],
+                        "status": "fail",
+                        "passed": False,
+                        "failure_category": "runner_exception",
+                        "within_budget": False,
+                        "verifier_passed": False,
+                        "expected_artifact_exists": False,
+                        "non_failure_stop_reason": False,
+                        "stop_reason": "runner_exception",
+                        "error_type": type(exc).__name__,
+                        "error": "task execution failed; inspect the per-task run evidence",
+                        "logical_decisions": None,
+                        "provider_requests": None,
+                        "provider_retries": None,
+                        "provider_responses": None,
+                        "provider_attempts": [],
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "total_tokens": None,
+                        "cached_tokens": None,
+                        "token_usage_coverage": 0.0,
+                        "chunk_count": 0,
+                        "chunk_lengths": [],
+                        "chunk_mean_length": 0.0,
+                        "chunk_max_length": 0,
+                        "chunk_interrupts": 0,
+                        "chunk_interrupt_rate": 0.0,
+                        "chunk_stop_distribution": {},
+                        "e2e_latency_ms": None,
+                    }
+                )
         summary = summarize_rows(rows)
         artifact = {
             "schema_version": BENCHMARK_SCHEMA_VERSION,
@@ -521,11 +582,11 @@ class BenchmarkEvaluator:
             },
             "benchmark": {
                 "source": str(self.benchmark_path.resolve().relative_to(self.repo_root)),
-                "task_count": len(benchmark["tasks"]),
+                "task_count": len(tasks),
             },
             "reproducibility": {
                 "fixture_snapshot_id": _fixture_snapshot_id(
-                    self.repo_root / str(task["fixture_repo"]) for task in benchmark["tasks"]
+                    self.repo_root / str(task["fixture_repo"]) for task in tasks
                 ),
                 "model_name": self.model_name,
                 "model_version": self.model_version,
@@ -536,7 +597,7 @@ class BenchmarkEvaluator:
                 },
                 "timezone": self.timezone_name,
                 "locale": _current_locale(),
-                "task_ids": [task["id"] for task in benchmark["tasks"]],
+                "task_ids": [task["id"] for task in tasks],
                 "action_chunking": dict(self.action_chunking),
             },
             "summary": summary,
@@ -584,12 +645,26 @@ class BenchmarkEvaluator:
         initial_task_summary_empty = not str(initial_memory_state["working"]["task_summary"]).strip()
         initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
 
+        run_started_at = time.monotonic()
         final_answer = agent.ask(task["prompt"])
+        e2e_latency_ms = int((time.monotonic() - run_started_at) * 1000)
         task_state = agent.current_task_state
         run_dir = Path(agent.current_run_dir)
         task_state_path = agent.run_store.task_state_path(task_state)
         report_path = agent.run_store.report_path(task_state)
         report = agent.run_store.load_report(task_state.run_id)
+        trace_events = [
+            json.loads(line)
+            for line in agent.run_store.trace_path(task_state).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        chunk_summaries = [
+            event for event in trace_events if event.get("event") == "chunk_finished"
+        ]
+        chunk_stop_distribution = {}
+        for chunk_summary in chunk_summaries:
+            reason = str(chunk_summary.get("stop_reason") or "completed")
+            chunk_stop_distribution[reason] = chunk_stop_distribution.get(reason, 0) + 1
 
         artifact_path = _artifact_path_for_task(task)
         artifact_file = fixture_copy_root / artifact_path
@@ -608,6 +683,28 @@ class BenchmarkEvaluator:
             expected_artifact_exists=expected_artifact_exists,
             non_failure_stop_reason=non_failure_stop_reason,
         )
+
+        provider_attempts = [dict(attempt) for attempt in task_state.provider_attempts]
+        token_fields = ("input_tokens", "output_tokens", "total_tokens")
+        token_usage_complete = bool(provider_attempts) and all(
+            all(attempt.get(field) is not None for field in token_fields)
+            for attempt in provider_attempts
+        )
+        token_usage_coverage = (
+            sum(
+                all(attempt.get(field) is not None for field in token_fields)
+                for attempt in provider_attempts
+            )
+            / len(provider_attempts)
+            if provider_attempts
+            else 0.0
+        )
+        token_totals = {
+            field: sum(int(attempt[field]) for attempt in provider_attempts)
+            if token_usage_complete and all(attempt.get(field) is not None for attempt in provider_attempts)
+            else None
+            for field in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens")
+        }
 
         return {
             "id": task["id"],
@@ -642,7 +739,13 @@ class BenchmarkEvaluator:
             "provider_requests": task_state.provider_requests,
             "provider_retries": task_state.provider_retries,
             "provider_responses": task_state.provider_responses,
-            "provider_attempts": [dict(attempt) for attempt in task_state.provider_attempts],
+            "provider_attempts": provider_attempts,
+            "provider_attempt_count": len(provider_attempts),
+            "input_tokens": token_totals["input_tokens"],
+            "output_tokens": token_totals["output_tokens"],
+            "total_tokens": token_totals["total_tokens"],
+            "cached_tokens": token_totals["cached_tokens"],
+            "token_usage_coverage": token_usage_coverage,
             "usage_missing_responses": task_state.usage_missing_responses,
             "usage_missing_rate": (
                 task_state.usage_missing_responses / task_state.provider_responses
@@ -664,8 +767,17 @@ class BenchmarkEvaluator:
                 else 0.0
             ),
             "chunk_lengths": list(task_state.chunk_lengths),
+            "chunk_mean_length": (
+                sum(task_state.chunk_lengths) / len(task_state.chunk_lengths)
+                if task_state.chunk_lengths
+                else 0.0
+            ),
+            "chunk_max_length": max(task_state.chunk_lengths, default=0),
+            "chunk_interrupts": task_state.chunk_interrupts,
+            "chunk_stop_distribution": chunk_stop_distribution,
             "final_answer": final_answer,
             "stop_reason": task_state.stop_reason,
+            "e2e_latency_ms": e2e_latency_ms,
             "initial_history_empty": initial_history_empty,
             "initial_memory_empty": initial_memory_empty,
             "initial_task_summary_empty": initial_task_summary_empty,
