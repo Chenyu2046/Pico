@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from pico.action_chunk import normalize_action_chunking
+from pico.config import load_project_env
 from pico.evaluation.evaluator import (
     DEFAULT_TIMEZONE,
     BenchmarkEvaluator,
@@ -40,9 +41,10 @@ from pico.runtime import Pico, SessionStore
 from pico.task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from pico.workspace import WorkspaceContext
 
-MODEL_NAME = "gpt-5.6-luna"
+MODEL_NAME = "gpt-5.6-terra"
 DEFAULT_BASE_URL = "https://api.longxiadev.store/v1"
 DEFAULT_OUTPUT_DIR = Path("artifacts/action-chunking-real")
+DEFAULT_TIMEOUT = 600
 ALLOWED_TOOLS = ["list_files", "read_file", "search"]
 GROUP_CONFIGS = {
     "A": {"enabled": False},
@@ -196,7 +198,18 @@ def _historical_baseline_worktree_context(benchmark_path):
         _cleanup_historical_baseline_worktree(worktree)
 
 
-def _run_baseline_task_set(worktree, artifact_path, workspace_root, task_ids, api_key, base_url, temperature, max_new_tokens, timeout):
+def _run_baseline_task_set(
+    worktree,
+    artifact_path,
+    workspace_root,
+    task_ids,
+    api_key,
+    base_url,
+    temperature,
+    max_new_tokens,
+    timeout,
+    model,
+):
     command = [
         sys.executable,
         str(worktree / "scripts" / "run_action_chunking_baseline.py"),
@@ -204,7 +217,7 @@ def _run_baseline_task_set(worktree, artifact_path, workspace_root, task_ids, ap
         "--output", str(artifact_path),
         "--workspace", str(workspace_root),
         "--base-url", base_url,
-        "--model", MODEL_NAME,
+        "--model", model,
         "--temperature", str(temperature),
         "--max-new-tokens", str(max_new_tokens),
         "--timeout", str(timeout),
@@ -227,6 +240,7 @@ def _run_historical_reference(
     temperature,
     max_new_tokens,
     timeout,
+    model,
 ):
     artifact_path = Path(run_root) / "historical" / f"baseline-{ORIGINAL_BASELINE_SHA[:12]}.json"
     artifact = _run_baseline_task_set(
@@ -239,6 +253,7 @@ def _run_historical_reference(
         temperature,
         max_new_tokens,
         timeout,
+        model,
     )
     return {
         "status": "passed",
@@ -397,6 +412,77 @@ def deterministic_model_factory(action_chunking):
     return factory
 
 
+def _looks_like_timeout(value):
+    text = str(value or "").lower()
+    return any(marker in text for marker in ("timed out", "timeout", "time out", "deadline exceeded"))
+
+
+def _smoke_trace_events(agent):
+    trace_path = Path(agent.current_run_dir) / "trace.jsonl"
+    if not trace_path.exists():
+        return []
+    events = []
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _smoke_diagnostics(agent, state):
+    events = _smoke_trace_events(agent)
+    provider_attempts = [event for event in events if event.get("event") == "provider_attempt"]
+    tool_events = [event for event in events if event.get("event") == "tool_executed"]
+    tool_failures = [
+        event for event in tool_events
+        if event.get("action_status") not in {None, "completed"}
+        or event.get("tool_status") not in {None, "ok"}
+        or event.get("result_known") is False
+    ]
+    model_failures = [event for event in events if event.get("event") == "model_failed"]
+    provider_errors = [
+        attempt.get("error")
+        for attempt in provider_attempts
+        if attempt.get("error")
+    ]
+    provider_errors.extend(
+        failure.get("error")
+        for failure in model_failures
+        if failure.get("error")
+    )
+    timeout_errors = [error for error in provider_errors if _looks_like_timeout(error)]
+
+    if tool_failures:
+        failure_class = "tool_execution_failure"
+    elif timeout_errors and tool_events:
+        failure_class = "provider_request_timeout_after_tool_observation"
+    elif timeout_errors:
+        failure_class = "initial_provider_request_timeout"
+    elif model_failures:
+        failure_class = "provider_request_failure"
+    elif not tool_events and state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED:
+        failure_class = "model_protocol_failure"
+    else:
+        failure_class = ""
+
+    last_error = provider_errors[-1] if provider_errors else ""
+    return {
+        "failure_class": failure_class,
+        "provider_request_count": int(state.provider_requests),
+        "provider_attempt_count": len(provider_attempts),
+        "provider_timeout_count": len(timeout_errors),
+        "tool_observation_count": len(tool_events),
+        "tool_failure_count": len(tool_failures),
+        "model_failure_count": len(model_failures),
+        "last_provider_error": agent.redact_text(str(last_error))[:500] if last_error else "",
+    }
+
+
 def _run_pico_smoke(model_client, action_chunking, allowed_tools, prompt):
     temporary_root = Path(tempfile.mkdtemp(prefix="pico-action-chunk-smoke-"))
     fixture_copy = temporary_root / "action_chunk_repo"
@@ -419,6 +505,7 @@ def _run_pico_smoke(model_client, action_chunking, allowed_tools, prompt):
             agent.ask(prompt)
         except Exception as exc:  # noqa: BLE001 - smoke converts provider/parser errors to evidence
             state = agent.current_task_state
+            diagnostics = _smoke_diagnostics(agent, state)
             return {
                 "status": "failed",
                 "reason": _safe_error(exc),
@@ -426,20 +513,28 @@ def _run_pico_smoke(model_client, action_chunking, allowed_tools, prompt):
                 "primitive_submissions": state.primitive_submissions,
                 "chunk_count": state.chunk_count,
                 "mean_chunk_length": 0.0,
+                "diagnostics": diagnostics,
             }
         state = agent.current_task_state
+        diagnostics = _smoke_diagnostics(agent, state)
         mean_chunk_length = (
             sum(state.chunk_lengths) / len(state.chunk_lengths)
             if state.chunk_lengths
             else 0.0
         )
+        status = "passed" if state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED else "failed"
+        reason = "" if status == "passed" else "smoke did not return a final answer"
+        if diagnostics["failure_class"] == "tool_execution_failure":
+            status = "failed"
+            reason = "tool_execution_failure"
         return {
-            "status": "passed" if state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED else "failed",
-            "reason": "" if state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED else "smoke did not return a final answer",
+            "status": status,
+            "reason": reason,
             "stop_reason": state.stop_reason,
             "primitive_submissions": state.primitive_submissions,
             "chunk_count": state.chunk_count,
             "mean_chunk_length": mean_chunk_length,
+            "diagnostics": diagnostics,
         }
     finally:
         shutil.rmtree(temporary_root, ignore_errors=True)
@@ -1198,7 +1293,7 @@ def _validate_contract(benchmark):
         raise ValueError("all action chunking tasks must use the semantic verifier")
 
 
-def _preflight(api_key, base_url, timeout, client_factory=None):
+def _preflight(api_key, base_url, timeout, client_factory=None, model=MODEL_NAME):
     def blocked_phase(reason):
         return {"status": "blocked", "reason": reason}
 
@@ -1214,7 +1309,7 @@ def _preflight(api_key, base_url, timeout, client_factory=None):
 
     if client_factory is None:
         client_factory = lambda: OpenAICompatibleModelClient(
-            model=MODEL_NAME,
+            model=model,
             base_url=base_url,
             api_key=api_key,
             temperature=0.0,
@@ -1230,23 +1325,40 @@ def _preflight(api_key, base_url, timeout, client_factory=None):
             logical_decision_id="preflight",
         )
     except Exception as exc:  # noqa: BLE001 - preflight must turn any provider failure into evidence
-        return {
+        result = {
             "status": "failed",
             "reason": _safe_error(exc, api_key),
             "elapsed_ms": int((time.monotonic() - started_at) * 1000),
-            "provider_requests": len(getattr(client, "last_provider_attempts", []) or []),
+            "provider_requests": int(
+                (getattr(client, "last_provider_metadata", {}) or {}).get(
+                    "provider_requests",
+                    len(getattr(client, "last_provider_attempts", []) or []),
+                )
+            ),
         }
+        redirect_diagnostic = getattr(client, "last_redirect_diagnostic", None)
+        if redirect_diagnostic:
+            result["http_308"] = redirect_diagnostic
+        return result
     usage = aggregate_provider_usage(getattr(client, "last_provider_attempts", []) or [])
     response_match = str(response).strip() == "PICO_RESPONSES_PREFLIGHT_OK"
     provider = {
         "status": "passed" if response_match else "failed",
         "response_match": response_match,
         "elapsed_ms": int((time.monotonic() - started_at) * 1000),
-        "provider_requests": len(getattr(client, "last_provider_attempts", []) or []),
+        "provider_requests": int(
+            (getattr(client, "last_provider_metadata", {}) or {}).get(
+                "provider_requests",
+                len(getattr(client, "last_provider_attempts", []) or []),
+            )
+        ),
         "token_usage_coverage": usage["token_usage_coverage"],
         "token_usage_complete": usage["token_usage_complete"],
         "response_text_recorded": False,
     }
+    redirect_diagnostic = getattr(client, "last_redirect_diagnostic", None)
+    if redirect_diagnostic:
+        provider["http_308"] = redirect_diagnostic
     if provider["status"] != "passed":
         reason = "provider response did not match the preflight contract"
         return {
@@ -1275,7 +1387,9 @@ def _preflight(api_key, base_url, timeout, client_factory=None):
         allowed_tools=ALLOWED_TOOLS,
         prompt=(
             "Inspect app/config.py, app/parser.py, and app/loader.py. "
-            "They are independent and all file paths are already known."
+            "All three paths are known and the read-only operations are independent. "
+            "Prefer one <chunk> containing exactly three read_file actions. "
+            "Do not chunk if a later action needs an earlier observation."
         ),
     )
     if chunk_smoke["status"] == "passed" and chunk_smoke["chunk_count"] > 0 and chunk_smoke["mean_chunk_length"] >= 2:
@@ -1306,7 +1420,9 @@ def run_real_benchmark(
     api_key=None,
     base_url=None,
     mode="final",
+    model=None,
 ):
+    load_project_env(REPO_ROOT)
     benchmark_path = Path(benchmark_path).resolve()
     benchmark = load_benchmark(benchmark_path)
     _validate_contract(benchmark)
@@ -1324,9 +1440,7 @@ def run_real_benchmark(
         raise ValueError("repetitions must be positive")
     base_url = base_url or os.environ.get("PICO_OPENAI_API_BASE", DEFAULT_BASE_URL)
     api_key = api_key if api_key is not None else os.environ.get("PICO_OPENAI_API_KEY", "")
-    model_from_env = os.environ.get("PICO_OPENAI_MODEL", "")
-    if model_from_env and model_from_env != MODEL_NAME:
-        raise ValueError(f"PICO_OPENAI_MODEL must be {MODEL_NAME}")
+    model = model or os.environ.get("PICO_OPENAI_MODEL", MODEL_NAME)
 
     commit_sha = _git_value(["rev-parse", "HEAD"], cwd=REPO_ROOT)
     timestamp = datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).strftime("%Y%m%d-%H%M%S%f")
@@ -1337,7 +1451,7 @@ def run_real_benchmark(
         "schema_version": 1,
         "mode": mode,
         "commit_sha": commit_sha,
-        "model": MODEL_NAME,
+        "model": model,
         "base_url": base_url,
         "temperature": temperature,
         "max_new_tokens": max_new_tokens,
@@ -1371,7 +1485,7 @@ def run_real_benchmark(
             [task for task in benchmark["tasks"] if task["id"] in task_ids]
         ),
     }
-    preflight = _preflight(api_key, base_url, timeout)
+    preflight = _preflight(api_key, base_url, timeout, model=model)
     environment["preflight"] = preflight
     _json_write(run_root / "environment.json", environment)
     if preflight.get("status") != "passed":
@@ -1438,6 +1552,7 @@ def run_real_benchmark(
                     temperature,
                     max_new_tokens,
                     timeout,
+                    model,
                 )
             except Exception as exc:  # noqa: BLE001 - keep primary experiment independent
                 historical_reference = {
@@ -1486,14 +1601,14 @@ def run_real_benchmark(
                 benchmark_path=benchmark_path,
                 artifact_path=artifact_path,
                 workspace_root=run_root / "workspaces" / group / f"rep-{repetition:02d}",
-                model_name=MODEL_NAME,
+                model_name=model,
                 model_version="openai-compatible-responses",
                 temperature=temperature,
                 top_p=1.0,
                 max_new_tokens=max_new_tokens,
                 timezone_name=DEFAULT_TIMEZONE,
                 model_client_factory=lambda task, workspace: OpenAICompatibleModelClient(
-                    model=MODEL_NAME,
+                    model=model,
                     base_url=base_url,
                     api_key=api_key,
                     temperature=temperature,
@@ -1530,7 +1645,8 @@ def _parse_args(argv=None):
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-new-tokens", type=int, default=768)
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--model", default="", help="OpenAI-compatible model id; defaults to PICO_OPENAI_MODEL or Terra.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--pilot", action="store_true", help="Run the fixed 10-task, one-repetition pilot.")
     parser.add_argument("--tasks", default="", help="Comma-separated fixed task IDs; use only for a documented subset/pilot.")
@@ -1540,6 +1656,8 @@ def _parse_args(argv=None):
 
 def main(argv=None):
     args = _parse_args(argv)
+    load_project_env(REPO_ROOT)
+    model = args.model or os.environ.get("PICO_OPENAI_MODEL", MODEL_NAME)
     task_ids = [item.strip() for item in args.tasks.split(",") if item.strip()] if args.tasks else None
     if args.pilot:
         task_ids = PILOT_TASK_IDS
@@ -1549,7 +1667,7 @@ def main(argv=None):
     base_url = os.environ.get("PICO_OPENAI_API_BASE", DEFAULT_BASE_URL)
     api_key = os.environ.get("PICO_OPENAI_API_KEY", "")
     if args.preflight_only:
-        result = _preflight(api_key, base_url, args.timeout)
+        result = _preflight(api_key, base_url, args.timeout, model=model)
         print(json.dumps({key: value for key, value in result.items() if key != "response_text"}, sort_keys=True))
         return 0 if result.get("status") == "passed" else 2
     run_root, summary = run_real_benchmark(
@@ -1564,6 +1682,7 @@ def main(argv=None):
         api_key=api_key,
         base_url=base_url,
         mode="pilot" if args.pilot else "final",
+        model=model,
     )
     print(f"artifact_root={run_root}")
     if args.pilot:

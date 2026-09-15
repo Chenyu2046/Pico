@@ -1,7 +1,9 @@
-import os
+import io
 import json
+import os
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,9 +13,9 @@ import pico as pico_pkg
 from pico import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
-    Pico,
-    OllamaModelClient,
     OpenAICompatibleModelClient,
+    OllamaModelClient,
+    Pico,
     SessionStore,
     WorkspaceContext,
     build_welcome,
@@ -453,6 +455,92 @@ def test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage():
     assert client.last_completion_metadata["cached_tokens"] == 1536
     assert client.last_completion_metadata["cache_hit"] is True
     assert client.last_completion_metadata["input_tokens"] == 2048
+
+
+def test_openai_compatible_client_canonicalizes_same_host_308_once():
+    captured_urls = []
+
+    class FakeResponse:
+        def __init__(self):
+            self.headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"output_text": "<final>ok</final>"}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured_urls.append(request.full_url)
+        if len(captured_urls) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                308,
+                "Permanent Redirect",
+                {"Location": "https://right.codes/v1/responses/"},
+                io.BytesIO(b"canonical endpoint"),
+            )
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="right.codes/codex-mini",
+        base_url="https://right.codes/v1",
+        api_key="sk-test",
+        temperature=0.0,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("hello", 42)
+
+    assert result == "<final>ok</final>"
+    assert captured_urls == [
+        "https://right.codes/v1/responses",
+        "https://right.codes/v1/responses/",
+    ]
+    assert client.last_redirect_diagnostic["http_status"] == 308
+    assert client.last_redirect_diagnostic["location_same_host"] is True
+    assert client.last_redirect_diagnostic["canonicalization_candidate"] is True
+    assert client.last_redirect_diagnostic["response_body_prefix"] == "canonical endpoint"
+
+
+def test_openai_compatible_client_does_not_follow_unknown_308_location():
+    captured = []
+    api_key = "sk-test"
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured.append((request.full_url, request.headers.get("Authorization")))
+        raise urllib.error.HTTPError(
+            request.full_url,
+            308,
+            "Permanent Redirect",
+            {"Location": "https://unknown.example/web/login", "Content-Type": "text/html"},
+            io.BytesIO(b"<html>redirect</html>"),
+        )
+
+    client = OpenAICompatibleModelClient(
+        model="gpt-5.6-terra",
+        base_url="https://right.codes/v1",
+        api_key=api_key,
+        temperature=0.0,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen), pytest.raises(RuntimeError, match="HTTP 308 redirect"):
+        client.complete("hello", 42)
+
+    assert len(captured) == 1
+    assert captured[0][1] == "Bearer " + api_key
+    assert client.last_redirect_diagnostic["request_url"] == "https://right.codes/v1/responses"
+    assert client.last_redirect_diagnostic["http_status"] == 308
+    assert client.last_redirect_diagnostic["location_same_host"] is False
+    assert client.last_redirect_diagnostic["response_body_prefix"] == "<html>redirect</html>"
+    assert api_key not in json.dumps(client.last_redirect_diagnostic)
 
 
 def test_openai_compatible_client_extracts_text_from_event_stream():

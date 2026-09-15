@@ -271,6 +271,108 @@ def test_preflight_requires_provider_tool_and_chunk_gates():
     assert result["pico_chunk_smoke"]["chunk_count"] > 0
 
 
+def test_preflight_keeps_successful_308_diagnostic_without_breaking_usage_gate():
+    class _CanonicalizedProviderClient(runner._DeterministicModelClient):
+        def complete(self, prompt, max_new_tokens, **kwargs):
+            response = super().complete(prompt, max_new_tokens, **kwargs)
+            self.last_provider_metadata["provider_requests"] = 2
+            self.last_redirect_diagnostic = {
+                "request_url": "https://api.example.invalid/v1/responses",
+                "http_status": 308,
+                "location": "https://api.example.invalid/v1/responses/",
+                "location_same_host": True,
+                "response_body_prefix": "canonical endpoint",
+            }
+            return response
+
+    clients = iter(
+        [
+            _CanonicalizedProviderClient(["PICO_RESPONSES_PREFLIGHT_OK"]),
+            runner.FakeModelClient(
+                [
+                    '<tool>{"name":"read_file","args":{"path":"app/config.py","start":1,"end":20}}</tool>',
+                    "<final>The timeout is 30.</final>",
+                ]
+            ),
+            runner.FakeModelClient(
+                [
+                    runner._chunk(
+                        [
+                            runner._tool("read_file", {"path": "app/config.py", "start": 1, "end": 20}),
+                            runner._tool("read_file", {"path": "app/parser.py", "start": 1, "end": 20}),
+                        ]
+                    ),
+                    "<final>Inspected.</final>",
+                ]
+            ),
+        ]
+    )
+    result = runner._preflight(
+        "local-test-key",
+        "https://api.example.invalid/v1",
+        1,
+        client_factory=lambda: next(clients),
+    )
+
+    assert result["status"] == "passed"
+    assert result["provider"]["provider_requests"] == 2
+    assert result["provider"]["token_usage_complete"] is True
+    assert result["provider"]["http_308"]["location_same_host"] is True
+
+
+class _TimeoutSmokeClient(runner.FakeModelClient):
+    def complete(self, prompt, max_new_tokens, **kwargs):
+        self.last_provider_attempts = [{"status": "error", "error": "The read operation timed out"}]
+        self.last_completion_metadata = {}
+        raise TimeoutError("The read operation timed out")
+
+
+class _TimeoutAfterToolSmokeClient(runner.FakeModelClient):
+    def complete(self, prompt, max_new_tokens, **kwargs):
+        if self.outputs:
+            return super().complete(prompt, max_new_tokens, **kwargs)
+        self.last_provider_attempts = [{"status": "error", "error": "The read operation timed out"}]
+        self.last_completion_metadata = {}
+        raise TimeoutError("The read operation timed out")
+
+
+def test_smoke_diagnostics_distinguish_provider_and_tool_failures():
+    initial_timeout = runner._run_pico_smoke(
+        _TimeoutSmokeClient([]),
+        action_chunking={"enabled": False},
+        allowed_tools=["read_file"],
+        prompt="Read app/config.py.",
+    )
+    assert initial_timeout["diagnostics"]["failure_class"] == "initial_provider_request_timeout"
+    assert initial_timeout["diagnostics"]["tool_observation_count"] == 0
+
+    after_observation_timeout = runner._run_pico_smoke(
+        _TimeoutAfterToolSmokeClient(
+            ['<tool>{"name":"read_file","args":{"path":"app/config.py","start":1,"end":20}}</tool>']
+        ),
+        action_chunking={"enabled": False},
+        allowed_tools=["read_file"],
+        prompt="Read app/config.py.",
+    )
+    assert after_observation_timeout["diagnostics"]["failure_class"] == "provider_request_timeout_after_tool_observation"
+    assert after_observation_timeout["diagnostics"]["tool_observation_count"] == 1
+
+    tool_failure = runner._run_pico_smoke(
+        runner.FakeModelClient(
+            [
+                '<tool>{"name":"read_file","args":{"path":"missing.py","start":1,"end":20}}</tool>',
+                "<final>Done.</final>",
+            ]
+        ),
+        action_chunking={"enabled": False},
+        allowed_tools=["read_file"],
+        prompt="Read missing.py.",
+    )
+    assert tool_failure["status"] == "failed"
+    assert tool_failure["diagnostics"]["failure_class"] == "tool_execution_failure"
+    assert tool_failure["diagnostics"]["tool_failure_count"] == 1
+
+
 def test_pilot_gate_passes_without_promoting_to_final_conclusion(tmp_path):
     task_ids = [f"T-{index}" for index in range(10)]
     artifact_paths = {}

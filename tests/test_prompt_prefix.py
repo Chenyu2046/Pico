@@ -36,3 +36,23 @@ def test_build_prompt_prefix_renders_tools_and_workspace_metadata(tmp_path):
     assert prefix.workspace_fingerprint == workspace.fingerprint()
     assert prefix.tool_signature == tool_signature(tools)
     assert prefix.built_at == "2026-06-02T00:00:00+08:00"
+
+
+def test_enabled_chunk_guidance_prefers_known_independent_reads(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    workspace = WorkspaceContext.build(tmp_path)
+    tools = build_tool_registry(_Agent(tmp_path))
+
+    prefix = build_prompt_prefix(
+        workspace=workspace,
+        tools=tools,
+        action_chunking={"enabled": True},
+    )
+
+    assert "at least two read-only operations" in prefix.text
+    assert "prefer one <chunk> call" in prefix.text
+    assert "depends on an earlier observation" in prefix.text
+    assert prefix.text.count('<chunk>{"actions":[{"name":"read_file"') == 1
+    assert '"path":"app/config.py"' in prefix.text
+    assert '"path":"app/parser.py"' in prefix.text
+    assert '"path":"app/loader.py"' in prefix.text

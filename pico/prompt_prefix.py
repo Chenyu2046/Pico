@@ -54,7 +54,7 @@ def build_prompt_prefix(workspace, tools, built_at=None, action_chunking=None):
     if chunk_enabled:
         examples.insert(
             2,
-            '<chunk>{"actions":[{"name":"list_files","args":{"path":"."}},{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}],"skill_id":"inspect_symbol"}</chunk>',
+            '<chunk>{"actions":[{"name":"read_file","args":{"path":"app/config.py","start":1,"end":80}},{"name":"read_file","args":{"path":"app/parser.py","start":1,"end":80}},{"name":"read_file","args":{"path":"app/loader.py","start":1,"end":80}}]}</chunk>',
         )
     examples.append("<final>Done.</final>")
     examples = "\n".join(examples)
@@ -63,7 +63,11 @@ def build_prompt_prefix(workspace, tools, built_at=None, action_chunking=None):
         chunk_rules = (
             f"- A chunk may contain at most {action_chunking['max_actions_per_chunk']} ordered read-only actions "
             f"from: {', '.join(action_chunking['allowed_tools'])}."
-            " Do not reference another action's result; use only already-known arguments."
+            " Do not reference another action's result; use only already-known arguments.\n"
+            "- When at least two read-only operations have known arguments and are independent of one another, "
+            "prefer one <chunk> call.\n"
+            "- If any later action argument depends on an earlier observation, do not use <chunk>; issue separate "
+            "<tool> calls so the observation can be consumed first."
         )
         if action_chunking["skill_guidance_enabled"]:
             chunk_rules += " Skill guidance is advisory; use boundary_hint=true only at a natural inspection boundary."

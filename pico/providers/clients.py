@@ -7,10 +7,11 @@ runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
 
 import json
 import time
-import uuid
-from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
+import uuid
+from http.client import RemoteDisconnected
+from urllib.parse import urljoin, urlparse
 
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
 
@@ -172,6 +173,54 @@ def _normalize_versioned_base_url(base_url):
     return base
 
 
+def _redact_provider_value(value, secret):
+    text = str(value or "")
+    return text.replace(secret, "<redacted>") if secret else text
+
+
+def _redirect_diagnostic(request_url, exc, secret, body=""):
+    location = exc.headers.get("Location", "") if exc.headers else ""
+    target_url = urljoin(request_url, location) if location else ""
+    source = urlparse(request_url)
+    target = urlparse(target_url) if target_url else None
+    same_host = bool(
+        target
+        and target.hostname
+        and source.hostname
+        and target.hostname.lower() == source.hostname.lower()
+    )
+    try:
+        same_origin = bool(
+            same_host
+            and target.scheme.lower() == source.scheme.lower()
+            and target.port == source.port
+        )
+    except ValueError:
+        same_origin = False
+    return {
+        "request_url": _redact_provider_value(request_url, secret),
+        "http_status": int(exc.code),
+        "location": _redact_provider_value(location, secret),
+        "location_same_host": same_host,
+        "location_target": _redact_provider_value(target_url, secret),
+        "response_body_prefix": _redact_provider_value(body[:500], secret),
+        "canonicalization_candidate": bool(
+            same_origin
+            and target
+            and not target.query
+            and not target.fragment
+            and target.path != source.path
+            and target.path == source.path.rstrip("/") + "/"
+        ),
+    }
+
+
+def _canonical_redirect_url(request_url, location, diagnostic):
+    if not diagnostic.get("canonicalization_candidate"):
+        return None
+    return urljoin(request_url, location) if location else None
+
+
 def _extract_openai_text(data):
     if data.get("output_text"):
         return data["output_text"]
@@ -322,6 +371,8 @@ class OpenAICompatibleModelClient:
         self.last_completion_metadata = {}
         self.last_provider_metadata = {}
         self.last_provider_attempts = []
+        self.last_redirect_diagnostic = None
+        self.responses_url = self.base_url + "/responses"
 
     def _record_provider_result(self, request_id, attempt_id, logical_decision_id, provider_requests, started_at, status="ok", error=""):
         self.last_provider_metadata = {
@@ -357,6 +408,7 @@ class OpenAICompatibleModelClient:
         self.last_completion_metadata = {}
         self.last_provider_metadata = {}
         self.last_provider_attempts = []
+        self.last_redirect_diagnostic = None
         request_id = "request_" + uuid.uuid4().hex[:12]
         started_at = time.monotonic()
         provider_requests = 0
@@ -393,12 +445,16 @@ class OpenAICompatibleModelClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        request = urllib.request.Request(
-            self.base_url + "/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
+        def make_request(endpoint):
+            return urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+
+        request = make_request(self.responses_url)
+        redirect_canonicalized = False
         attempts = 3
         for attempt in range(attempts):
             provider_requests = attempt + 1
@@ -411,6 +467,40 @@ class OpenAICompatibleModelClient:
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 308:
+                    diagnostic = _redirect_diagnostic(request.full_url, exc, self.api_key, body=body)
+                    self.last_redirect_diagnostic = diagnostic
+                    location = exc.headers.get("Location", "") if exc.headers else ""
+                    canonical_url = _canonical_redirect_url(request.full_url, location, diagnostic)
+                    if canonical_url and not redirect_canonicalized:
+                        redirect_canonicalized = True
+                        self.responses_url = canonical_url
+                        request = make_request(self.responses_url)
+                        continue
+                    self.last_provider_attempts.append(
+                        _provider_attempt_metadata(
+                            request_id,
+                            attempt + 1,
+                            logical_decision_id,
+                            provider_requests,
+                            attempt_started_at,
+                            status="redirect",
+                            error="HTTP 308 redirect requires explicit endpoint review",
+                        )
+                    )
+                    self._record_provider_result(
+                        request_id,
+                        attempt + 1,
+                        logical_decision_id,
+                        provider_requests,
+                        started_at,
+                        status="redirect",
+                        error="HTTP 308 redirect requires explicit endpoint review",
+                    )
+                    raise RuntimeError(
+                        "OpenAI-compatible request returned HTTP 308 redirect; "
+                        "inspect the redirect diagnostic before changing the endpoint"
+                    ) from exc
                 if exc.code >= 500 and attempt < attempts - 1:
                     self.last_provider_attempts.append(
                         _provider_attempt_metadata(
