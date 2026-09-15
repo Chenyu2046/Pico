@@ -47,7 +47,8 @@ def test_fake_model_a_b_c_contract_has_chunk_coverage_and_boundary_interrupts(tm
         assert artifact["summary"]["total_tasks"] == 20
         assert artifact["summary"]["passed"] == 20
         assert artifact["summary"]["verifier_pass_rate"] == 1.0
-        assert all(row["input_tokens"] is None for row in artifact["rows"])
+        assert all(row["input_tokens"] is not None for row in artifact["rows"])
+        assert all(row["token_usage_coverage"] == 1.0 for row in artifact["rows"])
 
     for group in ("B", "C"):
         positive_rows = [row for row in results[group]["rows"] if row["category"] in POSITIVE_CATEGORIES]
@@ -74,6 +75,9 @@ def test_fake_model_a_b_c_contract_has_chunk_coverage_and_boundary_interrupts(tm
         task_ids,
     )
     assert summary["conclusion"] == "PASS"
+    assert summary["primary_ablation"]["same_commit"] is True
+    assert len(set(summary["primary_ablation"]["group_commits"].values())) == 1
+    assert summary["gates"]["token_metric_valid"] is True
     assert summary["comparisons"]["B_vs_A"]["logical_decisions"]["reduction_pct"] > 15
 
 

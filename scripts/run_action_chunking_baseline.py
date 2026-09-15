@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from pico import Pico, SessionStore, WorkspaceContext
+from pico.evaluation.token_usage import aggregate_provider_usage
 from pico.providers.clients import OpenAICompatibleModelClient
 from pico.run_store import RunStore
 
@@ -170,6 +171,7 @@ def run(benchmark_path, output_path, workspace_root, api_key, base_url, model, t
         completed = state.stop_reason == "final_answer_returned"
         passed = within_budget and verifier_passed and artifact_path.exists() and completed
         attempts = [dict(item) for item in getattr(state, "provider_attempts", [])]
+        token_usage = aggregate_provider_usage(attempts)
         rows.append(
             {
                 "id": task["id"],
@@ -195,11 +197,12 @@ def run(benchmark_path, output_path, workspace_root, api_key, base_url, model, t
                 "chunk_mean_length": sum(state.chunk_lengths) / len(state.chunk_lengths) if state.chunk_lengths else 0.0,
                 "chunk_max_length": max(state.chunk_lengths, default=0),
                 "chunk_stop_distribution": {},
-                "input_tokens": None,
-                "output_tokens": None,
-                "total_tokens": None,
-                "cached_tokens": None,
-                "token_usage_coverage": 0.0,
+                "input_tokens": token_usage["input_tokens"],
+                "output_tokens": token_usage["output_tokens"],
+                "total_tokens": token_usage["total_tokens"],
+                "cached_tokens": token_usage["cached_tokens"],
+                "token_usage_coverage": token_usage["token_usage_coverage"],
+                "token_usage_complete": token_usage["token_usage_complete"],
                 "e2e_latency_ms": elapsed_ms,
                 "final_answer": final_answer,
                 "artifact_exists": artifact_path.exists(),

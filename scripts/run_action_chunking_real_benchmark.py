@@ -6,6 +6,7 @@ the provider preflight succeeds and the final gates pass.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,10 +30,15 @@ from pico.evaluation.evaluator import (
     _current_locale,
     _fixture_snapshot_id,
     _git_value,
+    aggregate_provider_usage,
     load_benchmark,
     run_fixed_benchmark,
 )
 from pico.providers.clients import FakeModelClient, OpenAICompatibleModelClient
+from pico.run_store import RunStore
+from pico.runtime import Pico, SessionStore
+from pico.task_state import STOP_REASON_FINAL_ANSWER_RETURNED
+from pico.workspace import WorkspaceContext
 
 MODEL_NAME = "gpt-5.6-luna"
 DEFAULT_BASE_URL = "https://api.longxiadev.store/v1"
@@ -96,7 +103,33 @@ def _redact(value, secret):
     return value
 
 
-def _prepare_baseline_worktree(benchmark_path):
+def _task_prompt_snapshot_id(tasks, task_ids):
+    prompts = {
+        task["id"]: str(task["prompt"])
+        for task in tasks
+        if task["id"] in set(task_ids)
+    }
+    payload = "\n".join(f"{task_id}\0{prompts[task_id]}" for task_id in task_ids)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cleanup_historical_baseline_worktree(worktree):
+    if worktree is None:
+        return
+    worktree = Path(worktree)
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        shutil.rmtree(worktree, ignore_errors=True)
+
+
+def _prepare_historical_baseline_worktree(benchmark_path):
     worktree = Path(tempfile.mkdtemp(prefix="pico-action-chunk-baseline-"))
     result = subprocess.run(
         ["git", "worktree", "add", "--detach", str(worktree), ORIGINAL_BASELINE_SHA],
@@ -106,17 +139,36 @@ def _prepare_baseline_worktree(benchmark_path):
         check=False,
     )
     if result.returncode != 0:
+        _cleanup_historical_baseline_worktree(worktree)
         raise RuntimeError("could not create original baseline worktree: " + _safe_error(result.stderr))
-    benchmark_target = worktree / "benchmarks" / "action_chunking_tasks.json"
-    benchmark_target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(benchmark_path, benchmark_target)
-    fixture_target = worktree / "benchmarks" / "fixtures" / "action_chunk_repo"
-    fixture_target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(REPO_ROOT / "benchmarks" / "fixtures" / "action_chunk_repo", fixture_target)
-    helper_target = worktree / "scripts" / "run_action_chunking_baseline.py"
-    helper_target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(REPO_ROOT / "scripts" / "run_action_chunking_baseline.py", helper_target)
-    return worktree
+
+    try:
+        benchmark_target = worktree / "benchmarks" / "action_chunking_tasks.json"
+        benchmark_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(benchmark_path, benchmark_target)
+        fixture_target = worktree / "benchmarks" / "fixtures" / "action_chunk_repo"
+        fixture_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(REPO_ROOT / "benchmarks" / "fixtures" / "action_chunk_repo", fixture_target)
+        helper_target = worktree / "scripts" / "run_action_chunking_baseline.py"
+        helper_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "scripts" / "run_action_chunking_baseline.py", helper_target)
+        usage_target = worktree / "pico" / "evaluation" / "token_usage.py"
+        usage_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "pico" / "evaluation" / "token_usage.py", usage_target)
+        return worktree
+    except Exception:
+        _cleanup_historical_baseline_worktree(worktree)
+        raise
+
+
+@contextmanager
+def _historical_baseline_worktree_context(benchmark_path):
+    worktree = None
+    try:
+        worktree = _prepare_historical_baseline_worktree(benchmark_path)
+        yield worktree
+    finally:
+        _cleanup_historical_baseline_worktree(worktree)
 
 
 def _run_baseline_task_set(worktree, artifact_path, workspace_root, task_ids, api_key, base_url, temperature, max_new_tokens, timeout):
@@ -133,10 +185,43 @@ def _run_baseline_task_set(worktree, artifact_path, workspace_root, task_ids, ap
         "--timeout", str(timeout),
         "--tasks", ",".join(task_ids),
     ]
-    result = subprocess.run(command, cwd=worktree, capture_output=True, text=True, check=False)
+    environment = dict(os.environ)
+    environment["PICO_OPENAI_API_KEY"] = api_key
+    result = subprocess.run(command, cwd=worktree, env=environment, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError("original baseline runner failed: " + _safe_error(result.stderr, api_key))
     return json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+
+
+def _run_historical_reference(
+    worktree,
+    run_root,
+    task_ids,
+    api_key,
+    base_url,
+    temperature,
+    max_new_tokens,
+    timeout,
+):
+    artifact_path = Path(run_root) / "historical" / f"baseline-{ORIGINAL_BASELINE_SHA[:12]}.json"
+    artifact = _run_baseline_task_set(
+        worktree,
+        artifact_path,
+        Path(run_root) / "workspaces" / "historical",
+        task_ids,
+        api_key,
+        base_url,
+        temperature,
+        max_new_tokens,
+        timeout,
+    )
+    return {
+        "status": "passed",
+        "commit_sha": ORIGINAL_BASELINE_SHA,
+        "artifact": str(artifact_path),
+        "summary": artifact.get("summary", {}),
+        "not_used_in_primary_comparisons": True,
+    }
 
 
 def _run_compatibility_regression(baseline_worktree, run_root):
@@ -222,18 +307,35 @@ def _planned_actions(task):
             end = 200 if path.endswith("catalog.py") else 80
             actions.append(_tool("read_file", {"path": path, "start": 1, "end": end}))
         return actions
-    return [
+    actions = [
         _tool(
             "search",
             {"pattern": pattern, "path": "tests" if pattern.startswith("test_") else "app"},
         )
         for pattern in workload.get("expected_patterns", [])
     ]
+    actions.extend(
+        _tool("read_file", {"path": path, "start": 1, "end": 80})
+        for path in workload.get("followup_paths", [])
+    )
+    return actions
 
 
 def _deterministic_outputs(task, action_chunking):
     actions = _planned_actions(task)
-    final = "<final>Inspection complete. " + task["prompt"] + "</final>"
+    final = (
+        "<final>Inspection complete. Observed facts: DEFAULT_TIMEOUT=30; RETRY_LIMIT=2; "
+        "ParseResult fields are method, route, body; the parser normalizes to GET; "
+        "the health route maps to health; the response has status 200 and data; "
+        "validation reports route must start with /; the request order is "
+        "validate_request -> route_request -> get_or_put -> format_response; "
+        "load_record records source path; cache reuse uses get, put, and get_or_put; "
+        "the fixture marker is deterministic-observation-catalog. Symbols observed: "
+        "parse_request, load_record, CacheStore, route_request, handle_request, "
+        "validate_request, format_response, test_parse_request_normalizes_method, "
+        "test_cache_reuses_value, test_health_route, test_service_formats_health_response, "
+        "PICO_TIMEOUT, ROUTE_TABLE, and action-fixture.</final>"
+    )
     if not action_chunking.get("enabled"):
         return actions + [final]
 
@@ -247,12 +349,75 @@ def _deterministic_outputs(task, action_chunking):
     return actions + [final]
 
 
+class _DeterministicModelClient(FakeModelClient):
+    def complete(self, prompt, max_new_tokens, **kwargs):
+        response = super().complete(prompt, max_new_tokens, **kwargs)
+        usage = {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 110,
+            "cached_tokens": 20,
+        }
+        self.last_completion_metadata.update(usage)
+        self.last_provider_metadata.update(usage)
+        self.last_provider_attempts[-1].update(usage)
+        return response
+
+
 def deterministic_model_factory(action_chunking):
     def factory(task, workspace):
         del workspace
-        return FakeModelClient(_deterministic_outputs(task, action_chunking))
+        return _DeterministicModelClient(_deterministic_outputs(task, action_chunking))
 
     return factory
+
+
+def _run_pico_smoke(model_client, action_chunking, allowed_tools, prompt):
+    temporary_root = Path(tempfile.mkdtemp(prefix="pico-action-chunk-smoke-"))
+    fixture_copy = temporary_root / "action_chunk_repo"
+    shutil.copytree(REPO_ROOT / "benchmarks" / "fixtures" / "action_chunk_repo", fixture_copy)
+    try:
+        workspace = WorkspaceContext.build(fixture_copy, repo_root_override=fixture_copy)
+        agent = Pico(
+            model_client=model_client,
+            workspace=workspace,
+            session_store=SessionStore(fixture_copy / ".pico" / "sessions"),
+            run_store=RunStore(fixture_copy / ".pico" / "runs"),
+            approval_policy="auto",
+            max_steps=8,
+            max_new_tokens=768,
+            allowed_tools=allowed_tools,
+            action_chunking=action_chunking,
+            secret_env_names=["PICO_OPENAI_API_KEY"],
+        )
+        try:
+            agent.ask(prompt)
+        except Exception as exc:  # noqa: BLE001 - smoke converts provider/parser errors to evidence
+            state = agent.current_task_state
+            return {
+                "status": "failed",
+                "reason": _safe_error(exc),
+                "stop_reason": state.stop_reason,
+                "primitive_submissions": state.primitive_submissions,
+                "chunk_count": state.chunk_count,
+                "mean_chunk_length": 0.0,
+            }
+        state = agent.current_task_state
+        mean_chunk_length = (
+            sum(state.chunk_lengths) / len(state.chunk_lengths)
+            if state.chunk_lengths
+            else 0.0
+        )
+        return {
+            "status": "passed" if state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED else "failed",
+            "reason": "" if state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED else "smoke did not return a final answer",
+            "stop_reason": state.stop_reason,
+            "primitive_submissions": state.primitive_submissions,
+            "chunk_count": state.chunk_count,
+            "mean_chunk_length": mean_chunk_length,
+        }
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
 
 
 def run_deterministic_benchmark(
@@ -314,6 +479,28 @@ def _aggregate_group(rows):
     chunk_lengths = [length for row in rows for length in row.get("chunk_lengths", [])]
     positive_rows = [row for row in rows if row.get("category") in POSITIVE_CATEGORIES]
     chunked_positive = [row for row in positive_rows if row.get("chunk_count", 0) > 0]
+    positive_chunk_lengths = [
+        length for row in positive_rows for length in row.get("chunk_lengths", [])
+    ]
+    provider_attempts = [
+        dict(attempt)
+        for row in rows
+        for attempt in row.get("provider_attempts", [])
+    ]
+    token_usage = aggregate_provider_usage(provider_attempts)
+    if not provider_attempts and rows:
+        token_usage = {
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "cached_tokens": None,
+            "token_usage_coverage": sum(
+                float(row.get("token_usage_coverage", 0.0)) for row in rows
+            ) / len(rows),
+            "token_usage_complete": all(
+                bool(row.get("token_usage_complete")) for row in rows
+            ),
+        }
     return {
         "task_runs": len(rows),
         "passed": sum(bool(row.get("passed")) for row in rows),
@@ -326,6 +513,7 @@ def _aggregate_group(rows):
         "input_tokens": _distribution(_numeric_values(rows, "input_tokens")),
         "output_tokens": _distribution(_numeric_values(rows, "output_tokens")),
         "total_tokens": _distribution(_numeric_values(rows, "total_tokens")),
+        "cached_tokens": _distribution(_numeric_values(rows, "cached_tokens")),
         "e2e_latency_ms": _distribution(_numeric_values(rows, "e2e_latency_ms")),
         "primitive_submissions": _distribution(_numeric_values(rows, "primitive_submissions")),
         "executed_tool_calls": _distribution(_numeric_values(rows, "executed_tool_calls")),
@@ -337,8 +525,17 @@ def _aggregate_group(rows):
             **_distribution(chunk_lengths),
             "mean": sum(chunk_lengths) / len(chunk_lengths) if chunk_lengths else None,
         },
+        "positive_chunk_lengths": {
+            **_distribution(positive_chunk_lengths),
+            "mean": (
+                sum(positive_chunk_lengths) / len(positive_chunk_lengths)
+                if positive_chunk_lengths
+                else None
+            ),
+        },
         "chunk_count": _distribution(_numeric_values(rows, "chunk_count")),
-        "token_usage_coverage": sum(float(row.get("token_usage_coverage", 0.0)) for row in rows) / len(rows) if rows else 0.0,
+        "token_usage_coverage": token_usage["token_usage_coverage"],
+        "token_usage_complete": token_usage["token_usage_complete"],
         "positive_chunk_coverage": len(chunked_positive) / len(positive_rows) if positive_rows else 0.0,
         "positive_task_runs": len(positive_rows),
         "positive_chunked_task_runs": len(chunked_positive),
@@ -376,17 +573,32 @@ def _successful_rows(rows):
     return [row for row in rows if row.get("passed") and row.get("verifier_passed")]
 
 
-def summarize_real_artifacts(artifact_paths, task_ids):
-    artifacts = {group: [json.loads(Path(path).read_text(encoding="utf-8")) for path in paths] for group, paths in artifact_paths.items()}
-    rows = {group: [row for artifact in group_artifacts for row in artifact.get("rows", [])] for group, group_artifacts in artifacts.items()}
+def _protocol_error_count(rows):
+    return sum(
+        row.get("failure_category") in {"runner_exception", "failure_stop_reason"}
+        or row.get("stop_reason") in {"model_error", "action_sequence_mismatch"}
+        for row in rows
+    )
+
+
+def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
+    artifacts = {
+        group: [json.loads(Path(path).read_text(encoding="utf-8")) for path in paths]
+        for group, paths in artifact_paths.items()
+    }
+    rows = {
+        group: [row for artifact in group_artifacts for row in artifact.get("rows", [])]
+        for group, group_artifacts in artifacts.items()
+    }
     groups = {group: _aggregate_group(group_rows) for group, group_rows in rows.items()}
+    metrics = ("logical_decisions", "provider_requests", "input_tokens", "total_tokens", "e2e_latency_ms")
     comparisons = {
         f"{group}_vs_A": {
             metric: _paired_comparison(rows[group], rows["A"], metric)
-            for metric in ("logical_decisions", "provider_requests", "input_tokens", "total_tokens", "e2e_latency_ms")
+            for metric in metrics
         }
         for group in ("B", "C")
-        if group in rows
+        if group in rows and "A" in rows
     }
     paired_successful_comparisons = {
         f"{group}_vs_A": {
@@ -395,11 +607,22 @@ def summarize_real_artifacts(artifact_paths, task_ids):
                 _successful_rows(rows["A"]),
                 metric,
             )
-            for metric in ("logical_decisions", "provider_requests", "input_tokens", "total_tokens", "e2e_latency_ms")
+            for metric in metrics
         }
         for group in ("B", "C")
-        if group in rows
+        if group in rows and "A" in rows
     }
+    token_metric_valid = (
+        sorted(groups) == ["A", "B", "C"]
+        and all(groups[group].get("token_usage_coverage", 0.0) >= 0.90 for group in groups)
+    )
+    if not token_metric_valid:
+        for comparison_set in (comparisons, paired_successful_comparisons):
+            for comparison in comparison_set.values():
+                for metric in ("input_tokens", "total_tokens"):
+                    comparison[metric]["reduction_pct"] = None
+                    comparison[metric]["invalid_reason"] = "token_usage_coverage_below_90pct"
+
     a_pass = groups.get("A", {}).get("pass_rate", 0.0)
     logical_reductions = {
         key: value["logical_decisions"].get("reduction_pct")
@@ -411,12 +634,15 @@ def summarize_real_artifacts(artifact_paths, task_ids):
         "task_count_is_20": len(task_ids) == 20,
         "coverage_B_ge_80pct": groups.get("B", {}).get("positive_chunk_coverage", 0.0) >= 0.80,
         "coverage_C_ge_80pct": groups.get("C", {}).get("positive_chunk_coverage", 0.0) >= 0.80,
-        "mean_chunk_length_B_ge_1_8": groups.get("B", {}).get("chunk_lengths", {}).get("mean") is not None and groups["B"]["chunk_lengths"]["mean"] >= 1.8,
-        "mean_chunk_length_C_ge_1_8": groups.get("C", {}).get("chunk_lengths", {}).get("mean") is not None and groups["C"]["chunk_lengths"]["mean"] >= 1.8,
+        "mean_chunk_length_B_ge_1_8": groups.get("B", {}).get("positive_chunk_lengths", {}).get("mean") is not None
+        and groups["B"]["positive_chunk_lengths"]["mean"] >= 1.8,
+        "mean_chunk_length_C_ge_1_8": groups.get("C", {}).get("positive_chunk_lengths", {}).get("mean") is not None
+        and groups["C"]["positive_chunk_lengths"]["mean"] >= 1.8,
         "correctness_B_within_5pp": groups.get("B", {}).get("pass_rate", 0.0) >= a_pass - 0.05,
         "correctness_C_within_5pp": groups.get("C", {}).get("pass_rate", 0.0) >= a_pass - 0.05,
         "logical_reduction_B_ge_15pct": (logical_reductions.get("B_vs_A") or -1.0) >= 15.0,
         "logical_reduction_C_ge_15pct": (logical_reductions.get("C_vs_A") or -1.0) >= 15.0,
+        "token_metric_valid": token_metric_valid,
     }
     if not gates["groups_present"] or not gates["task_count_is_20"]:
         conclusion = "INCONCLUSIVE"
@@ -429,18 +655,75 @@ def summarize_real_artifacts(artifact_paths, task_ids):
         "mean_chunk_length_C_ge_1_8",
         "logical_reduction_B_ge_15pct",
         "logical_reduction_C_ge_15pct",
+        "token_metric_valid",
     )):
         conclusion = "INCONCLUSIVE"
     else:
         conclusion = "PASS"
+
+    primary_group_commits = {}
+    for group, group_artifacts in artifacts.items():
+        commits = {
+            artifact.get("runtime", {}).get("commit_sha")
+            for artifact in group_artifacts
+            if artifact.get("runtime", {}).get("commit_sha")
+        }
+        if len(commits) == 1:
+            primary_group_commits[group] = next(iter(commits))
+    primary_ablation = {
+        "group_commits": primary_group_commits,
+        "same_commit": len(primary_group_commits) == 3 and len(set(primary_group_commits.values())) == 1,
+    }
+
+    pilot_gates = {}
+    pilot_status = None
+    pilot_reason = ""
+    if mode == "pilot":
+        protocol_rates = {
+            group: _protocol_error_count(rows.get(group, [])) / len(rows[group])
+            if rows.get(group) else 1.0
+            for group in ("A", "B", "C")
+        }
+        pilot_gates = {
+            "task_count_is_10": len(task_ids) == 10,
+            "A_pass_rate_ge_80pct": groups.get("A", {}).get("pass_rate", 0.0) >= 0.80,
+            "coverage_B_ge_70pct": groups.get("B", {}).get("positive_chunk_coverage", 0.0) >= 0.70,
+            "coverage_C_ge_70pct": groups.get("C", {}).get("positive_chunk_coverage", 0.0) >= 0.70,
+            "mean_chunk_length_B_ge_1_5": groups.get("B", {}).get("positive_chunk_lengths", {}).get("mean") is not None
+            and groups["B"]["positive_chunk_lengths"]["mean"] >= 1.5,
+            "mean_chunk_length_C_ge_1_5": groups.get("C", {}).get("positive_chunk_lengths", {}).get("mean") is not None
+            and groups["C"]["positive_chunk_lengths"]["mean"] >= 1.5,
+            "protocol_errors_not_systemic": all(rate <= 0.20 for rate in protocol_rates.values()),
+        }
+        pilot_status = "PASS" if all(pilot_gates.values()) else "FAIL"
+        if not pilot_gates["task_count_is_10"]:
+            pilot_reason = "pilot_contract_invalid"
+        elif not pilot_gates["A_pass_rate_ge_80pct"]:
+            pilot_reason = "insufficient_correctness"
+        elif not all(pilot_gates[name] for name in (
+            "coverage_B_ge_70pct",
+            "coverage_C_ge_70pct",
+            "mean_chunk_length_B_ge_1_5",
+            "mean_chunk_length_C_ge_1_5",
+        )):
+            pilot_reason = "insufficient_chunk_adoption"
+        elif not pilot_gates["protocol_errors_not_systemic"]:
+            pilot_reason = "systemic_protocol_errors"
+
     return {
         "schema_version": 1,
+        "mode": mode,
         "task_ids": list(task_ids),
         "groups": groups,
         "comparisons": comparisons,
         "paired_successful_comparisons": paired_successful_comparisons,
+        "primary_ablation": primary_ablation,
         "gates": gates,
-        "conclusion": conclusion,
+        "pilot_gates": pilot_gates,
+        "pilot_status": pilot_status,
+        "pilot_reason": pilot_reason,
+        "conclusion": "INCONCLUSIVE" if mode == "pilot" else conclusion,
+        "final_conclusion": "INCONCLUSIVE" if mode == "pilot" else conclusion,
     }
 
 
@@ -449,6 +732,8 @@ def render_report(summary, environment):
         return "n/a" if number is None else f"{number:.2f}"
 
     def value(group, metric):
+        if metric in {"input_tokens", "total_tokens"} and not summary.get("gates", {}).get("token_metric_valid", False):
+            return "n/a"
         item = summary["groups"].get(group, {}).get(metric, {}).get("median")
         return format_number(item)
 
@@ -464,11 +749,21 @@ def render_report(summary, environment):
         f"- Model: `{environment['model']}`",
         f"- Task runs: `{len(summary['task_ids'])} tasks x {environment['repetitions']} repetitions x 3 groups`",
         "",
+        "## Primary A/B/C ablation",
+        "",
+    ]
+    group_commits = environment.get("group_commits", summary.get("primary_ablation", {}).get("group_commits", {}))
+    for group in ("A", "B", "C"):
+        lines.append(f"- {group} commit: `{group_commits.get(group, 'n/a')}`")
+    lines.extend([
+        f"- Same commit across A/B/C: `{'PASS' if summary.get('primary_ablation', {}).get('same_commit') else 'FAIL'}`",
+        "- Only treatment variable: `action_chunking`",
+        "",
         "## Group metrics",
         "",
         "| Group | Verifier pass | Logical decisions P25 / P50 / P75 | Provider requests P50 | Total tokens P50 | E2E ms P50 | Positive chunk coverage | Chunk length P50 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
-    ]
+    ])
     for group in ("A", "B", "C"):
         data = summary["groups"].get(group, {})
         logical = data.get("logical_decisions", {})
@@ -526,11 +821,21 @@ def render_report(summary, environment):
             f"interrupt rate `{data.get('chunk_interrupt_rate', 0.0):.2%}`, "
             f"token usage coverage `{data.get('token_usage_coverage', 0.0):.2%}`"
         )
+    historical = summary.get("historical_reference") or environment.get("historical_reference")
+    if historical:
+        lines.extend([
+            "",
+            "## Historical reference",
+            "",
+            f"- Commit: `{historical.get('commit_sha', 'n/a')}`",
+            f"- Artifact: `{historical.get('artifact', 'n/a')}`",
+            "- Historical data is not used in primary Action Chunking causal comparisons.",
+        ])
     compatibility = summary.get("compatibility_regression") or environment.get("compatibility_regression")
     if compatibility:
         lines.extend([
             "",
-            "## Existing 12-task regression",
+            "## Compatibility regression",
             "",
             "| Run | Commit | Passed | Chunk count zero |",
             "|---|---|---:|---:|",
@@ -546,12 +851,33 @@ def render_report(summary, environment):
         lines.append(f"- {'PASS' if passed else 'FAIL'}: {name}")
     lines.extend([
         "",
+        "## Experimental validity",
+        "",
+        f"- Same Pico commit across A/B/C: `{'PASS' if summary.get('primary_ablation', {}).get('same_commit') else 'FAIL'}`",
+        "- Same model and decoding config: `PASS`",
+        "- Same task prompts: `PASS`",
+        "- Same fixture snapshot: `PASS`",
+        "- Same max_steps: `PASS`",
+        f"- Token coverage >= 90%: `{'PASS' if summary.get('gates', {}).get('token_metric_valid') else 'FAIL'}`",
+        f"- Chunk coverage gate: `{'PASS' if summary.get('gates', {}).get('coverage_B_ge_80pct') and summary.get('gates', {}).get('coverage_C_ge_80pct') else 'FAIL'}`",
+    ])
+    if summary.get("pilot_status") is not None:
+        lines.extend([
+            "",
+            "## Pilot gate",
+            "",
+            f"- Status: `{summary['pilot_status']}`",
+            f"- Reason: `{summary.get('pilot_reason') or 'n/a'}`",
+            "- Final conclusion: `INCONCLUSIVE` (pilot is not the final experiment)",
+        ])
+    lines.extend([
+        "",
         "## Measurement boundary",
         "",
         "- Logical decisions count model-planning rounds recorded by TaskState; provider retries are not counted as logical decisions.",
         "- E2E latency is `time.monotonic()` around `agent.ask()` and includes runtime/tool execution for the task.",
         "- Token totals are reported only when every provider attempt has input/output/total usage; missing usage remains null.",
-        "- Group A runs from the original baseline commit while groups B/C run from the current commit; this preserves a true ReAct baseline but includes the commit delta in the comparison.",
+        "- Primary A/B/C runs all execute from the current Pico commit; the historical commit is reported separately and excluded from causal comparisons.",
         "- The old 12-task regression benchmark is compatibility evidence only and is not included in this performance conclusion.",
     ])
     return "\n".join(lines) + "\n"
@@ -581,18 +907,34 @@ def _validate_contract(benchmark):
         raise ValueError("benchmark artifact paths must stay inside the fixture")
     if any(not str(task["verifier"]).lstrip().startswith("python -c ") for task in tasks):
         raise ValueError("benchmark verifiers must use the fixed Python -c form")
+    if any("check_semantic" not in task["verifier"] for task in tasks):
+        raise ValueError("all action chunking tasks must use the semantic verifier")
 
 
-def _preflight(api_key, base_url, timeout):
+def _preflight(api_key, base_url, timeout, client_factory=None):
+    def blocked_phase(reason):
+        return {"status": "blocked", "reason": reason}
+
     if not api_key:
-        return {"status": "blocked", "reason": "PICO_OPENAI_API_KEY is not set"}
-    client = OpenAICompatibleModelClient(
-        model=MODEL_NAME,
-        base_url=base_url,
-        api_key=api_key,
-        temperature=0.0,
-        timeout=timeout,
-    )
+        reason = "PICO_OPENAI_API_KEY is not set"
+        return {
+            "status": "blocked",
+            "reason": reason,
+            "provider": blocked_phase(reason),
+            "pico_tool_smoke": blocked_phase("provider preflight did not pass"),
+            "pico_chunk_smoke": blocked_phase("provider preflight did not pass"),
+        }
+
+    if client_factory is None:
+        client_factory = lambda: OpenAICompatibleModelClient(
+            model=MODEL_NAME,
+            base_url=base_url,
+            api_key=api_key,
+            temperature=0.0,
+            timeout=timeout,
+        )
+
+    client = client_factory()
     started_at = time.monotonic()
     try:
         response = client.complete(
@@ -607,12 +949,61 @@ def _preflight(api_key, base_url, timeout):
             "elapsed_ms": int((time.monotonic() - started_at) * 1000),
             "provider_requests": len(getattr(client, "last_provider_attempts", []) or []),
         }
-    return {
-        "status": "passed" if str(response).strip() == "PICO_RESPONSES_PREFLIGHT_OK" else "failed",
-        "response_match": str(response).strip() == "PICO_RESPONSES_PREFLIGHT_OK",
+    usage = aggregate_provider_usage(getattr(client, "last_provider_attempts", []) or [])
+    response_match = str(response).strip() == "PICO_RESPONSES_PREFLIGHT_OK"
+    provider = {
+        "status": "passed" if response_match and usage["token_usage_complete"] else "failed",
+        "response_match": response_match,
         "elapsed_ms": int((time.monotonic() - started_at) * 1000),
         "provider_requests": len(getattr(client, "last_provider_attempts", []) or []),
+        "token_usage_coverage": usage["token_usage_coverage"],
+        "token_usage_complete": usage["token_usage_complete"],
         "response_text_recorded": False,
+    }
+    if provider["status"] != "passed":
+        reason = "provider response or usage metadata did not pass"
+        return {
+            "status": "failed",
+            "reason": reason,
+            "provider": provider,
+            "pico_tool_smoke": blocked_phase(reason),
+            "pico_chunk_smoke": blocked_phase(reason),
+        }
+
+    tool_smoke = _run_pico_smoke(
+        client_factory(),
+        action_chunking={"enabled": False},
+        allowed_tools=["read_file"],
+        prompt="Read app/config.py and report the actual configured timeout value.",
+    )
+    if tool_smoke["status"] == "passed" and tool_smoke["primitive_submissions"] >= 1:
+        tool_smoke["status"] = "passed"
+    else:
+        tool_smoke["status"] = "blocked"
+        tool_smoke["reason"] = tool_smoke.get("reason") or "model did not complete Pico tool protocol"
+
+    chunk_smoke = _run_pico_smoke(
+        client_factory(),
+        action_chunking=GROUP_CONFIGS["B"],
+        allowed_tools=ALLOWED_TOOLS,
+        prompt=(
+            "Inspect app/config.py, app/parser.py, and app/loader.py. "
+            "They are independent and all file paths are already known."
+        ),
+    )
+    if chunk_smoke["status"] == "passed" and chunk_smoke["chunk_count"] > 0 and chunk_smoke["mean_chunk_length"] >= 2:
+        chunk_smoke["status"] = "passed"
+    else:
+        chunk_smoke["status"] = "blocked"
+        chunk_smoke["reason"] = "model_did_not_adopt_chunk_protocol"
+
+    all_passed = tool_smoke["status"] == "passed" and chunk_smoke["status"] == "passed"
+    return {
+        "status": "passed" if all_passed else "blocked",
+        "reason": "" if all_passed else (chunk_smoke.get("reason") or tool_smoke.get("reason")),
+        "provider": provider,
+        "pico_tool_smoke": tool_smoke,
+        "pico_chunk_smoke": chunk_smoke,
     }
 
 
@@ -627,8 +1018,9 @@ def run_real_benchmark(
     task_ids=None,
     api_key=None,
     base_url=None,
+    mode="final",
 ):
-    benchmark_path = Path(benchmark_path)
+    benchmark_path = Path(benchmark_path).resolve()
     benchmark = load_benchmark(benchmark_path)
     _validate_contract(benchmark)
     task_ids = list(task_ids or [task["id"] for task in benchmark["tasks"]])
@@ -650,11 +1042,12 @@ def run_real_benchmark(
 
     commit_sha = _git_value(["rev-parse", "HEAD"], cwd=REPO_ROOT)
     timestamp = datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).strftime("%Y%m%d-%H%M%S%f")
-    run_root = Path(output_dir) / f"{timestamp}-{commit_sha[:12]}"
+    run_root = Path(output_dir).resolve() / f"{timestamp}-{commit_sha[:12]}"
     run_root.mkdir(parents=True, exist_ok=False)
     fixture_paths = [REPO_ROOT / str(task["fixture_repo"]) for task in benchmark["tasks"] if task["id"] in task_ids]
     environment = {
         "schema_version": 1,
+        "mode": mode,
         "commit_sha": commit_sha,
         "model": MODEL_NAME,
         "base_url": base_url,
@@ -663,6 +1056,7 @@ def run_real_benchmark(
         "timeout": timeout,
         "approval": "auto",
         "task_ids": task_ids,
+        "task_prompt_snapshot_id": _task_prompt_snapshot_id(benchmark["tasks"], task_ids),
         "step_budget": 8,
         "repetitions": repetitions,
         "group_order_by_repetition": {
@@ -679,13 +1073,31 @@ def run_real_benchmark(
         "api_key_present": bool(api_key),
         "api_key_source": "PICO_OPENAI_API_KEY",
         "baseline_commit_sha": ORIGINAL_BASELINE_SHA,
-        "group_commits": {"A": ORIGINAL_BASELINE_SHA, "B": commit_sha, "C": commit_sha},
+        "historical_baseline_commit_sha": ORIGINAL_BASELINE_SHA,
+        "group_commits": {group: commit_sha for group in groups},
     }
     preflight = _preflight(api_key, base_url, timeout)
     environment["preflight"] = preflight
     _json_write(run_root / "environment.json", environment)
     if preflight.get("status") != "passed":
-        summary = {"schema_version": 1, "task_ids": task_ids, "groups": {}, "comparisons": {}, "gates": {}, "conclusion": "INCONCLUSIVE", "preflight": preflight}
+        summary = {
+            "schema_version": 1,
+            "mode": mode,
+            "task_ids": task_ids,
+            "groups": {},
+            "comparisons": {},
+            "gates": {"token_metric_valid": False},
+            "primary_ablation": {
+                "group_commits": dict(environment["group_commits"]),
+                "same_commit": True,
+            },
+            "pilot_gates": {},
+            "pilot_status": "BLOCKED" if mode == "pilot" else None,
+            "pilot_reason": "preflight_not_passed" if mode == "pilot" else "",
+            "conclusion": "INCONCLUSIVE",
+            "final_conclusion": "INCONCLUSIVE",
+            "preflight": preflight,
+        }
         _json_write(run_root / "summary.json", summary)
         (run_root / "report.md").write_text(
             "# Pico Action Chunking Real-Model Benchmark\n\n"
@@ -695,29 +1107,64 @@ def run_real_benchmark(
         )
         return run_root, summary
 
-    try:
-        baseline_worktree = _prepare_baseline_worktree(benchmark_path)
-    except Exception as exc:
-        environment["baseline_setup"] = {"status": "failed", "reason": _safe_error(exc, api_key)}
-        _json_write(run_root / "environment.json", environment)
-        raise
-    environment["baseline_setup"] = {
-        "status": "passed",
-        "worktree": str(baseline_worktree),
+    historical_reference = {
+        "status": "not_run",
         "commit_sha": ORIGINAL_BASELINE_SHA,
+        "not_used_in_primary_comparisons": True,
     }
+    compatibility_regression = {"status": "not_run"}
     try:
-        compatibility_regression = _run_compatibility_regression(baseline_worktree, run_root)
-        compatibility_regression["status"] = "passed" if all(
-            item["total_tasks"] == 12 and item["passed"] == 12 and item["all_chunk_count_zero"]
-            for item in compatibility_regression.values()
-        ) else "failed"
-    except Exception as exc:  # noqa: BLE001 - preserve real-run evidence if compatibility setup fails
+        with _historical_baseline_worktree_context(benchmark_path) as baseline_worktree:
+            environment["baseline_setup"] = {
+                "status": "passed",
+                "worktree": str(baseline_worktree),
+                "commit_sha": ORIGINAL_BASELINE_SHA,
+            }
+            try:
+                historical_reference = _run_historical_reference(
+                    baseline_worktree,
+                    run_root,
+                    task_ids,
+                    api_key,
+                    base_url,
+                    temperature,
+                    max_new_tokens,
+                    timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep primary experiment independent
+                historical_reference = {
+                    "status": "failed",
+                    "commit_sha": ORIGINAL_BASELINE_SHA,
+                    "reason": _safe_error(exc, api_key),
+                    "not_used_in_primary_comparisons": True,
+                }
+            try:
+                compatibility_regression = _run_compatibility_regression(baseline_worktree, run_root)
+                compatibility_regression["status"] = "passed" if all(
+                    compatibility_regression.get(name, {}).get("total_tasks") == 12
+                    and compatibility_regression.get(name, {}).get("passed") == 12
+                    and compatibility_regression.get(name, {}).get("all_chunk_count_zero")
+                    for name in ("before", "after")
+                ) else "failed"
+            except Exception as exc:  # noqa: BLE001 - preserve real-run evidence if compatibility setup fails
+                compatibility_regression = {
+                    "status": "failed",
+                    "reason": _safe_error(exc, api_key),
+                }
+    except Exception as exc:  # noqa: BLE001 - historical evidence must not contaminate primary A/B/C
+        environment["baseline_setup"] = {"status": "failed", "reason": _safe_error(exc, api_key)}
+        historical_reference = {
+            "status": "failed",
+            "commit_sha": ORIGINAL_BASELINE_SHA,
+            "reason": _safe_error(exc, api_key),
+            "not_used_in_primary_comparisons": True,
+        }
         compatibility_regression = {
             "status": "failed",
             "reason": _safe_error(exc, api_key),
         }
     environment["compatibility_regression"] = compatibility_regression
+    environment["historical_reference"] = historical_reference
     _json_write(run_root / "environment.json", environment)
 
     artifact_paths = {group: [] for group in groups}
@@ -727,20 +1174,6 @@ def run_real_benchmark(
             if group not in groups:
                 continue
             artifact_path = run_root / group / f"rep-{repetition:02d}.json"
-            if group == "A":
-                _run_baseline_task_set(
-                    baseline_worktree,
-                    artifact_path,
-                    run_root / "workspaces" / group / f"rep-{repetition:02d}",
-                    task_ids,
-                    api_key,
-                    base_url,
-                    temperature,
-                    max_new_tokens,
-                    timeout,
-                )
-                artifact_paths[group].append(artifact_path)
-                continue
             evaluator = BenchmarkEvaluator(
                 benchmark_path=benchmark_path,
                 artifact_path=artifact_path,
@@ -764,11 +1197,13 @@ def run_real_benchmark(
             _json_write(artifact_path, _redact(artifact, api_key))
             artifact_paths[group].append(artifact_path)
 
-    summary = summarize_real_artifacts(artifact_paths, task_ids)
+    summary = summarize_real_artifacts(artifact_paths, task_ids, mode=mode)
     summary["preflight"] = preflight
     summary["compatibility_regression"] = compatibility_regression
-    if compatibility_regression.get("status") != "passed" and summary["conclusion"] == "PASS":
+    summary["historical_reference"] = historical_reference
+    if mode != "pilot" and compatibility_regression.get("status") != "passed" and summary["conclusion"] == "PASS":
         summary["conclusion"] = "NEEDS_REVISION"
+        summary["final_conclusion"] = "NEEDS_REVISION"
     _json_write(run_root / "summary.json", summary)
     (run_root / "report.md").write_text(render_report(summary, environment), encoding="utf-8")
     return run_root, summary
@@ -814,10 +1249,14 @@ def main(argv=None):
         task_ids=task_ids,
         api_key=api_key,
         base_url=base_url,
+        mode="pilot" if args.pilot else "final",
     )
     print(f"artifact_root={run_root}")
-    print(f"conclusion={summary.get('conclusion', 'INCONCLUSIVE')}")
-    return 0 if summary.get("conclusion") == "PASS" else 2
+    if args.pilot:
+        print(f"pilot_status={summary.get('pilot_status', 'BLOCKED')}")
+        return 0 if summary.get("pilot_status") == "PASS" else 2
+    print(f"conclusion={summary.get('final_conclusion', summary.get('conclusion', 'INCONCLUSIVE'))}")
+    return 0 if summary.get("final_conclusion", summary.get("conclusion")) == "PASS" else 2
 
 
 if __name__ == "__main__":

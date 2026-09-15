@@ -20,6 +20,7 @@ from ..runtime import Pico, SessionStore
 from ..task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from ..tools import legal_tool_names
 from ..workspace import WorkspaceContext
+from .token_usage import aggregate_provider_usage
 
 BENCHMARK_SCHEMA_VERSION = 1
 DEFAULT_BENCHMARK_PATH = Path("benchmarks/coding_tasks.json")
@@ -685,26 +686,7 @@ class BenchmarkEvaluator:
         )
 
         provider_attempts = [dict(attempt) for attempt in task_state.provider_attempts]
-        token_fields = ("input_tokens", "output_tokens", "total_tokens")
-        token_usage_complete = bool(provider_attempts) and all(
-            all(attempt.get(field) is not None for field in token_fields)
-            for attempt in provider_attempts
-        )
-        token_usage_coverage = (
-            sum(
-                all(attempt.get(field) is not None for field in token_fields)
-                for attempt in provider_attempts
-            )
-            / len(provider_attempts)
-            if provider_attempts
-            else 0.0
-        )
-        token_totals = {
-            field: sum(int(attempt[field]) for attempt in provider_attempts)
-            if token_usage_complete and all(attempt.get(field) is not None for attempt in provider_attempts)
-            else None
-            for field in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens")
-        }
+        token_usage = aggregate_provider_usage(provider_attempts)
 
         return {
             "id": task["id"],
@@ -741,11 +723,12 @@ class BenchmarkEvaluator:
             "provider_responses": task_state.provider_responses,
             "provider_attempts": provider_attempts,
             "provider_attempt_count": len(provider_attempts),
-            "input_tokens": token_totals["input_tokens"],
-            "output_tokens": token_totals["output_tokens"],
-            "total_tokens": token_totals["total_tokens"],
-            "cached_tokens": token_totals["cached_tokens"],
-            "token_usage_coverage": token_usage_coverage,
+            "input_tokens": token_usage["input_tokens"],
+            "output_tokens": token_usage["output_tokens"],
+            "total_tokens": token_usage["total_tokens"],
+            "cached_tokens": token_usage["cached_tokens"],
+            "token_usage_coverage": token_usage["token_usage_coverage"],
+            "token_usage_complete": token_usage["token_usage_complete"],
             "usage_missing_responses": task_state.usage_missing_responses,
             "usage_missing_rate": (
                 task_state.usage_missing_responses / task_state.provider_responses
