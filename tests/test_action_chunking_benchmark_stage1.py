@@ -35,6 +35,11 @@ EXPECTED_CONTRACT = {
     "task_prompt_snapshot_id": "sha256:prompt-20-v1",
     "step_budget_summary": {"min": 8, "max": 8, "unique": [8], "count": 20},
 }
+PILOT_EXPECTED_CONTRACT = {
+    "fixture_snapshot_id": "sha256:fixture-v1",
+    "task_prompt_snapshot_id": "sha256:prompt-10-v1",
+    "step_budget_summary": {"min": 8, "max": 8, "unique": [8], "count": 10},
+}
 
 
 def _row(task_id, group, *, usage=True):
@@ -121,8 +126,9 @@ def _artifact_set(tmp_path, *, repetitions=3, commits=None, task_ids=None, usage
 
 def _summary(artifact_paths, *, task_ids=TASK_IDS, mode="final", expected_contract=None):
     kwargs = {"mode": mode}
-    if expected_contract is not None:
-        kwargs["expected_contract"] = expected_contract
+    if expected_contract is None:
+        expected_contract = PILOT_EXPECTED_CONTRACT if mode == "pilot" else EXPECTED_CONTRACT
+    kwargs["expected_contract"] = expected_contract
     return runner.summarize_real_artifacts(artifact_paths, task_ids, **kwargs)
 
 
@@ -270,6 +276,23 @@ def test_expected_contract_snapshot_mismatches_fail_closed(
     assert invalid["experimental_validity"][matches_field] is False
     assert invalid["gates"]["experimental_validity"] is False
     assert invalid["final_conclusion"] != "PASS"
+
+
+@pytest.mark.parametrize(
+    ("mode", "repetitions", "task_ids"),
+    [("final", 3, TASK_IDS), ("pilot", 1, PILOT_TASK_IDS)],
+)
+def test_missing_expected_contract_fails_closed(tmp_path, mode, repetitions, task_ids):
+    summary = runner.summarize_real_artifacts(
+        _artifact_set(tmp_path, repetitions=repetitions, task_ids=task_ids),
+        task_ids,
+        mode=mode,
+    )
+
+    assert summary["experimental_validity"]["valid"] is False
+    assert summary["final_conclusion"] != "PASS"
+    if mode == "pilot":
+        assert summary["pilot_status"] == "FAIL"
 
 
 def test_positive_three_repetition_fixtures_include_real_artifact_metadata(tmp_path):

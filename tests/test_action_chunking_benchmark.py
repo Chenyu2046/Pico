@@ -70,9 +70,14 @@ def test_fake_model_a_b_c_contract_has_chunk_coverage_and_boundary_interrupts(tm
     )
 
     task_ids = [row["id"] for row in results["A"]["rows"]]
+    reproducibility = results["A"]["reproducibility"]
     summary = summarize_real_artifacts(
         {group: [tmp_path / f"deterministic-{group}.json"] for group in GROUP_CONFIGS},
         task_ids,
+        expected_contract={
+            field: reproducibility[field]
+            for field in ("task_prompt_snapshot_id", "fixture_snapshot_id", "step_budget_summary")
+        },
     )
     assert summary["artifact_integrity"]["repetition_integrity"] is False
     assert summary["gates"]["repetition_integrity"] is False

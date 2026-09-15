@@ -48,6 +48,16 @@ def _write_artifact(path, rows):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _expected_contract(artifact_paths):
+    reproducibility = json.loads(
+        Path(artifact_paths["A"][0]).read_text(encoding="utf-8")
+    )["reproducibility"]
+    return {
+        field: reproducibility[field]
+        for field in ("task_prompt_snapshot_id", "fixture_snapshot_id", "step_budget_summary")
+    }
+
+
 def _pilot_row(task_id, group, index, *, chunked=True):
     positive = {"id": task_id, "category": "known_path_multi_file_inspection"}
     return {
@@ -269,7 +279,12 @@ def test_pilot_gate_passes_without_promoting_to_final_conclusion(tmp_path):
         _write_artifact(path, [_pilot_row(task_id, group, index) for index, task_id in enumerate(task_ids)])
         artifact_paths[group] = [path]
 
-    summary = runner.summarize_real_artifacts(artifact_paths, task_ids, mode="pilot")
+    summary = runner.summarize_real_artifacts(
+        artifact_paths,
+        task_ids,
+        mode="pilot",
+        expected_contract=_expected_contract(artifact_paths),
+    )
     assert summary["pilot_status"] == "PASS"
     assert summary["final_conclusion"] == "INCONCLUSIVE"
 
@@ -277,7 +292,12 @@ def test_pilot_gate_passes_without_promoting_to_final_conclusion(tmp_path):
         artifact_paths["B"][0],
         [_pilot_row(task_id, "B", index, chunked=index == 0) for index, task_id in enumerate(task_ids)],
     )
-    failed = runner.summarize_real_artifacts(artifact_paths, task_ids, mode="pilot")
+    failed = runner.summarize_real_artifacts(
+        artifact_paths,
+        task_ids,
+        mode="pilot",
+        expected_contract=_expected_contract(artifact_paths),
+    )
     assert failed["pilot_status"] == "FAIL"
     assert failed["pilot_reason"] == "insufficient_chunk_adoption"
 
@@ -296,7 +316,11 @@ def test_invalid_token_coverage_disables_token_reduction(tmp_path):
         _write_artifact(path, [row])
         artifact_paths[group] = [path]
 
-    summary = runner.summarize_real_artifacts(artifact_paths, task_ids)
+    summary = runner.summarize_real_artifacts(
+        artifact_paths,
+        task_ids,
+        expected_contract=_expected_contract(artifact_paths),
+    )
     assert summary["gates"]["token_metric_valid"] is False
     assert summary["comparisons"]["B_vs_A"]["input_tokens"]["reduction_pct"] is None
 
