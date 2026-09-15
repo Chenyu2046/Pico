@@ -756,7 +756,7 @@ def _experimental_validity(artifacts, task_ids, expected_contract=None):
 
     def matches_expected(field):
         if expected_contract is None:
-            return True
+            return False
         expected = expected_contract.get(field)
         return (
             expected is not None
@@ -1319,6 +1319,7 @@ def run_real_benchmark(
         raise ValueError("real benchmark requires exactly groups A B C")
     if len(task_ids) != len(set(task_ids)):
         raise ValueError("task IDs must not repeat")
+    task_ids = [task["id"] for task in benchmark["tasks"] if task["id"] in task_ids]
     if repetitions < 1:
         raise ValueError("repetitions must be positive")
     base_url = base_url or os.environ.get("PICO_OPENAI_API_BASE", DEFAULT_BASE_URL)
