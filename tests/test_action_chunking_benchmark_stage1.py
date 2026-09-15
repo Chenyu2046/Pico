@@ -30,6 +30,11 @@ BASE_REPRODUCIBILITY = {
         },
     },
 }
+EXPECTED_CONTRACT = {
+    "fixture_snapshot_id": "sha256:fixture-v1",
+    "task_prompt_snapshot_id": "sha256:prompt-20-v1",
+    "step_budget_summary": {"min": 8, "max": 8, "unique": [8], "count": 20},
+}
 
 
 def _row(task_id, group, *, usage=True):
@@ -114,8 +119,23 @@ def _artifact_set(tmp_path, *, repetitions=3, commits=None, task_ids=None, usage
     return artifact_paths
 
 
-def _summary(artifact_paths, *, task_ids=TASK_IDS, mode="final"):
-    return runner.summarize_real_artifacts(artifact_paths, task_ids, mode=mode)
+def _summary(artifact_paths, *, task_ids=TASK_IDS, mode="final", expected_contract=None):
+    kwargs = {"mode": mode}
+    if expected_contract is not None:
+        kwargs["expected_contract"] = expected_contract
+    return runner.summarize_real_artifacts(artifact_paths, task_ids, **kwargs)
+
+
+def _set_correctness(artifact_paths, group, percentage):
+    for path in artifact_paths[group]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        passed_count = round(len(payload["rows"]) * percentage / 100)
+        for index, row in enumerate(payload["rows"]):
+            passed = index < passed_count
+            row["passed"] = passed
+            row["verifier_passed"] = passed
+            row["status"] = "pass" if passed else "fail"
+        path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_final_same_commit_is_hard_gate_and_consistent_commits_pass(tmp_path):
@@ -149,6 +169,109 @@ def test_rendered_same_commit_status_comes_from_artifacts(tmp_path):
     assert "Same commit across A/B/C: `PASS`" not in report
 
 
+@pytest.mark.parametrize(
+    ("counts", "baseline_expected", "b_expected", "c_expected", "status_expected"),
+    [
+        ((0, 0, 0), False, True, True, False),
+        ((85, 80, 85), True, True, True, True),
+        ((100, 90, 90), True, False, False, False),
+    ],
+)
+def test_final_correctness_uses_absolute_and_relative_thresholds(
+    tmp_path,
+    counts,
+    baseline_expected,
+    b_expected,
+    c_expected,
+    status_expected,
+):
+    artifact_paths = _artifact_set(tmp_path)
+    for group, count in zip(("A", "B", "C"), counts):
+        _set_correctness(artifact_paths, group, count)
+
+    summary = _summary(artifact_paths)
+
+    assert summary["gates"]["baseline_correctness_A_ge_80pct"] is baseline_expected
+    assert summary["gates"]["correctness_B_within_5pp"] is b_expected
+    assert summary["gates"]["correctness_C_within_5pp"] is c_expected
+    assert (summary["final_conclusion"] == "PASS") is status_expected
+    if counts == (0, 0, 0):
+        assert summary["final_conclusion"] == "INCONCLUSIVE"
+    elif counts == (100, 90, 90):
+        assert summary["final_conclusion"] == "NEEDS_REVISION"
+
+
+def test_annotate_primary_artifact_preserves_observed_contract_fields():
+    observed = {
+        "fixture_snapshot_id": "observed-fixture",
+        "task_prompt_snapshot_id": "observed-prompt",
+        "step_budget_summary": {"min": 7, "max": 9, "unique": [7, 8, 9], "count": 3},
+    }
+    artifact = {"reproducibility": deepcopy(observed)}
+    environment = deepcopy(BASE_REPRODUCIBILITY)
+    environment.update(
+        {
+            "commit_sha": "environment-commit",
+            "model": "gpt-5.6-luna",
+            "step_budget": 8,
+            "task_prompt_snapshot_id": "expected-prompt",
+            "fixture_snapshot_id": "expected-fixture",
+            "step_budget_summary": {"min": 8, "max": 8, "unique": [8], "count": 20},
+        }
+    )
+
+    runner._annotate_primary_artifact(
+        artifact,
+        "A",
+        1,
+        TASK_IDS,
+        environment,
+    )
+
+    for field in ("fixture_snapshot_id", "task_prompt_snapshot_id", "step_budget_summary"):
+        assert artifact["reproducibility"][field] == observed[field]
+
+
+def test_expected_contract_matching_snapshots_pass(tmp_path):
+    matching = _summary(_artifact_set(tmp_path), expected_contract=EXPECTED_CONTRACT)
+
+    assert matching["experimental_validity"]["matches_expected_prompt_snapshot"] is True
+    assert matching["experimental_validity"]["matches_expected_fixture_snapshot"] is True
+    assert matching["experimental_validity"]["matches_expected_step_budget"] is True
+    assert matching["gates"]["experimental_validity"] is True
+    assert matching["final_conclusion"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("field", "matches_field", "mismatch"),
+    [
+        ("task_prompt_snapshot_id", "matches_expected_prompt_snapshot", "wrong-prompt"),
+        ("fixture_snapshot_id", "matches_expected_fixture_snapshot", "wrong-fixture"),
+        (
+            "step_budget_summary",
+            "matches_expected_step_budget",
+            {"min": 7, "max": 7, "unique": [7], "count": 20},
+        ),
+    ],
+)
+def test_expected_contract_snapshot_mismatches_fail_closed(
+    tmp_path,
+    field,
+    matches_field,
+    mismatch,
+):
+    artifact_paths = _artifact_set(tmp_path)
+
+    payload = json.loads(artifact_paths["B"][0].read_text(encoding="utf-8"))
+    payload["reproducibility"][field] = mismatch
+    artifact_paths["B"][0].write_text(json.dumps(payload), encoding="utf-8")
+    invalid = _summary(artifact_paths, expected_contract=EXPECTED_CONTRACT)
+
+    assert invalid["experimental_validity"][matches_field] is False
+    assert invalid["gates"]["experimental_validity"] is False
+    assert invalid["final_conclusion"] != "PASS"
+
+
 def test_positive_three_repetition_fixtures_include_real_artifact_metadata(tmp_path):
     artifacts = _artifact_set(tmp_path)
 
@@ -177,13 +300,17 @@ def test_final_requires_explicit_fixed_action_chunking_treatment_matrix(tmp_path
         for group in ("A", "B", "C"):
             for path in artifact_paths[group]:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                payload["reproducibility"]["action_chunking"] = deepcopy(runner.GROUP_CONFIGS["A"])
+                payload["reproducibility"]["action_chunking"] = runner.normalize_action_chunking(
+                    runner.GROUP_CONFIGS["A"]
+                )
                 path.write_text(json.dumps(payload), encoding="utf-8")
     else:
         for group in ("B", "C"):
             for path in artifact_paths[group]:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                payload["reproducibility"]["action_chunking"] = deepcopy(runner.GROUP_CONFIGS["A"])
+                payload["reproducibility"]["action_chunking"] = runner.normalize_action_chunking(
+                    runner.GROUP_CONFIGS["A"]
+                )
                 path.write_text(json.dumps(payload), encoding="utf-8")
 
     summary = _summary(artifact_paths)
@@ -238,16 +365,19 @@ def test_final_repetition_integrity_rejects_different_files_with_duplicate_ident
 ):
     artifact_paths = _artifact_set(tmp_path)
     original = artifact_paths["C"][0]
-    duplicate = tmp_path / "C" / f"rep-04-{duplicate_identity}.json"
-    payload = json.loads(original.read_text(encoding="utf-8"))
+    duplicate = tmp_path / "C" / f"rep-03-{duplicate_identity}.json"
+    payload = json.loads(artifact_paths["C"][2].read_text(encoding="utf-8"))
     payload["rows"][0]["e2e_latency_ms"] = 11
     if duplicate_identity == "artifact_id":
-        payload["repetition"] = 4
+        payload["artifact_id"] = json.loads(original.read_text(encoding="utf-8"))["artifact_id"]
     else:
+        payload = json.loads(original.read_text(encoding="utf-8"))
         payload["artifact_id"] = "C-rep-04-unique"
         payload["repetition"] = 1
     duplicate.write_text(json.dumps(payload), encoding="utf-8")
-    artifact_paths["C"] = [*artifact_paths["C"], duplicate]
+    artifact_paths["C"][2] = duplicate
+
+    assert len(artifact_paths["C"]) == len(artifact_paths["A"]) == len(artifact_paths["B"]) == 3
 
     summary = _summary(artifact_paths)
 
@@ -353,6 +483,96 @@ def test_pilot_requires_exactly_one_repetition_before_chunk_and_correctness_gate
     assert one_repetition["pilot_gates"]["coverage_B_ge_70pct"] is True
     assert one_repetition["pilot_gates"]["coverage_C_ge_70pct"] is True
     assert one_repetition["pilot_status"] == "PASS"
+
+
+def test_pilot_rejects_single_artifacts_with_non_one_repetition_metadata(tmp_path):
+    artifact_paths = _artifact_set(tmp_path, repetitions=1, task_ids=PILOT_TASK_IDS)
+    for path in artifact_paths["A"] + artifact_paths["B"] + artifact_paths["C"]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["repetition"] = 2
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = _summary(artifact_paths, task_ids=PILOT_TASK_IDS, mode="pilot")
+
+    assert summary["artifact_integrity"]["exact_one_repetition"] is False
+    assert summary["pilot_gates"]["exactly_one_repetition"] is False
+    assert summary["pilot_status"] == "FAIL"
+
+
+def test_pilot_requires_experimental_validity_even_when_protocol_coverage_passes(tmp_path):
+    artifact_paths = _artifact_set(tmp_path, repetitions=1, task_ids=PILOT_TASK_IDS)
+    for path in artifact_paths["B"] + artifact_paths["C"]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["reproducibility"]["action_chunking"] = runner.normalize_action_chunking(
+            runner.GROUP_CONFIGS["A"]
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = _summary(artifact_paths, task_ids=PILOT_TASK_IDS, mode="pilot")
+
+    assert summary["pilot_gates"]["coverage_B_ge_70pct"] is True
+    assert summary["pilot_gates"]["coverage_C_ge_70pct"] is True
+    assert summary["experimental_validity"]["action_chunking_unique_treatment"] is False
+    assert summary["pilot_gates"]["experimental_validity"] is False
+    assert summary["pilot_status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    ("counts", "b_expected", "c_expected", "status_expected"),
+    [
+        ((100, 0, 0), False, False, False),
+        ((100, 90, 90), False, False, False),
+        ((90, 90, 90), True, True, True),
+    ],
+)
+def test_pilot_uses_relative_b_c_correctness_not_chunk_or_protocol_coverage(
+    tmp_path,
+    counts,
+    b_expected,
+    c_expected,
+    status_expected,
+):
+    artifact_paths = _artifact_set(tmp_path, repetitions=1, task_ids=PILOT_TASK_IDS)
+    for group, count in zip(("A", "B", "C"), counts):
+        _set_correctness(artifact_paths, group, count)
+
+    summary = _summary(artifact_paths, task_ids=PILOT_TASK_IDS, mode="pilot")
+
+    assert summary["pilot_gates"]["coverage_B_ge_70pct"] is True
+    assert summary["pilot_gates"]["coverage_C_ge_70pct"] is True
+    assert summary["pilot_gates"]["experimental_validity"] is True
+    assert summary["pilot_gates"]["correctness_B_within_5pp"] is b_expected
+    assert summary["pilot_gates"]["correctness_C_within_5pp"] is c_expected
+    assert (summary["pilot_status"] == "PASS") is status_expected
+
+
+def test_rendered_treatment_line_is_dynamic_for_invalid_and_valid_experiments(tmp_path):
+    invalid_artifacts = _artifact_set(tmp_path / "invalid")
+    for path in invalid_artifacts["C"]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["reproducibility"]["action_chunking"] = runner.normalize_action_chunking(
+            runner.GROUP_CONFIGS["A"]
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    valid_artifacts = _artifact_set(tmp_path / "valid")
+
+    def treatment_line(summary):
+        report = runner.render_report(
+            summary,
+            {"commit_sha": "commit-x", "model": "gpt-5.6-luna", "repetitions": 3},
+        )
+        lines = [
+            line
+            for line in report.splitlines()
+            if "Action Chunking is the only treatment" in line
+        ]
+        assert len(lines) == 1
+        return lines[0]
+
+    invalid_line = treatment_line(_summary(invalid_artifacts))
+    valid_line = treatment_line(_summary(valid_artifacts))
+    assert invalid_line == "- Action Chunking is the only treatment: `FAIL`"
+    assert valid_line == "- Action Chunking is the only treatment: `PASS`"
 
 
 def _run_fixture_verifier(fixture, command):

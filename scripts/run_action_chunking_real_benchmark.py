@@ -113,6 +113,16 @@ def _task_prompt_snapshot_id(tasks, task_ids):
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _step_budget_summary(tasks):
+    budgets = [int(task["step_budget"]) for task in tasks]
+    return {
+        "min": min(budgets) if budgets else None,
+        "max": max(budgets) if budgets else None,
+        "unique": sorted(set(budgets)),
+        "count": len(budgets),
+    }
+
+
 def _cleanup_historical_baseline_worktree(worktree):
     if worktree is None:
         return
@@ -670,8 +680,14 @@ def _artifact_integrity(artifact_paths, artifacts, task_ids, mode):
     counts_equal = len(set(counts.values())) == 1 if counts else False
     min_repetitions = 3 if mode == "final" else 1
     enough_repetitions = counts_equal and all(counts.get(group, 0) >= min_repetitions for group in expected_groups)
-    exact_one_repetition = groups_present and counts_equal and all(
-        counts.get(group, 0) == 1 for group in expected_groups
+    exact_one_repetition = (
+        groups_present
+        and counts_equal
+        and all(counts.get(group, 0) == 1 for group in expected_groups)
+        and complete
+        and not duplicate_paths
+        and not duplicate_ids
+        and not duplicate_repetitions
     )
     repetition_shape_valid = (
         enough_repetitions if mode == "final" else exact_one_repetition
@@ -702,7 +718,7 @@ def _artifact_integrity(artifact_paths, artifacts, task_ids, mode):
     }
 
 
-def _experimental_validity(artifacts, task_ids):
+def _experimental_validity(artifacts, task_ids, expected_contract=None):
     all_artifacts = [artifact for group in ("A", "B", "C") for artifact in artifacts.get(group, [])]
     reproducibility = [artifact.get("reproducibility", {}) for artifact in all_artifacts]
     runtime = [artifact.get("runtime", {}) for artifact in all_artifacts]
@@ -738,6 +754,20 @@ def _experimental_validity(artifacts, task_ids):
         and same_field(reproducibility, "execution_config")
     )
 
+    def matches_expected(field):
+        if expected_contract is None:
+            return True
+        expected = expected_contract.get(field)
+        return (
+            expected is not None
+            and bool(reproducibility)
+            and all(_canonical(item.get(field)) == _canonical(expected) for item in reproducibility)
+        )
+
+    matches_expected_prompt_snapshot = matches_expected("task_prompt_snapshot_id")
+    matches_expected_fixture_snapshot = matches_expected("fixture_snapshot_id")
+    matches_expected_step_budget = matches_expected("step_budget_summary")
+
     common_fields = ("model_name", "model_version", "decoding", "fixture_snapshot_id")
     common_configuration = (
         all(same_field(reproducibility, field) for field in common_fields)
@@ -745,6 +775,9 @@ def _experimental_validity(artifacts, task_ids):
         and same_prompt_snapshot
         and same_step_budget
         and same_execution_config
+        and matches_expected_prompt_snapshot
+        and matches_expected_fixture_snapshot
+        and matches_expected_step_budget
     )
     action_configs = {
         group: [artifact.get("reproducibility", {}).get("action_chunking") for artifact in artifacts.get(group, [])]
@@ -769,6 +802,9 @@ def _experimental_validity(artifacts, task_ids):
         "same_fixture_snapshot": same_fixture_snapshot,
         "same_step_budget": same_step_budget,
         "same_execution_config": same_execution_config,
+        "matches_expected_prompt_snapshot": matches_expected_prompt_snapshot,
+        "matches_expected_fixture_snapshot": matches_expected_fixture_snapshot,
+        "matches_expected_step_budget": matches_expected_step_budget,
         "action_chunking_unique_treatment": action_chunking_unique_treatment,
         "all_required_fields_consistent": all(
             (
@@ -780,6 +816,9 @@ def _experimental_validity(artifacts, task_ids):
                 same_fixture_snapshot,
                 same_step_budget,
                 same_execution_config,
+                matches_expected_prompt_snapshot,
+                matches_expected_fixture_snapshot,
+                matches_expected_step_budget,
             )
         ),
     }
@@ -791,18 +830,10 @@ def _annotate_primary_artifact(artifact, group, repetition, task_ids, environmen
     artifact["artifact_id"] = f"{group}-rep-{repetition:02d}"
     artifact["group"] = group
     artifact["repetition"] = repetition
-    reproducibility = artifact.setdefault("reproducibility", {})
-    reproducibility["task_ids"] = list(task_ids)
-    reproducibility["task_prompt_snapshot_id"] = environment["task_prompt_snapshot_id"]
-    reproducibility["prompt_snapshot_id"] = environment["task_prompt_snapshot_id"]
-    reproducibility["fixture_snapshot_id"] = environment["fixture_snapshot_id"]
-    reproducibility["step_budget"] = environment["step_budget"]
-    if environment.get("step_budget_summary") is not None:
-        reproducibility["step_budget_summary"] = environment["step_budget_summary"]
     return artifact
 
 
-def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
+def summarize_real_artifacts(artifact_paths, task_ids, mode="final", expected_contract=None):
     artifacts = {
         group: [json.loads(Path(path).read_text(encoding="utf-8")) for path in paths]
         for group, paths in artifact_paths.items()
@@ -845,7 +876,7 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
                     comparison[metric]["invalid_reason"] = "token_usage_coverage_below_90pct"
 
     integrity = _artifact_integrity(artifact_paths, artifacts, task_ids, mode)
-    experimental_validity = _experimental_validity(artifacts, task_ids)
+    experimental_validity = _experimental_validity(artifacts, task_ids, expected_contract)
     a_pass = groups.get("A", {}).get("pass_rate", 0.0)
     logical_reductions = {
         key: value["logical_decisions"].get("reduction_pct")
@@ -858,6 +889,7 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
         "same_commit_across_groups": experimental_validity["same_commit"],
         "repetition_integrity": integrity["repetition_integrity"],
         "experimental_validity": experimental_validity["valid"],
+        "baseline_correctness_A_ge_80pct": a_pass >= 0.80,
         "coverage_B_ge_80pct": groups.get("B", {}).get("positive_chunk_coverage", 0.0) >= 0.80,
         "coverage_C_ge_80pct": groups.get("C", {}).get("positive_chunk_coverage", 0.0) >= 0.80,
         "mean_chunk_length_B_ge_1_8": groups.get("B", {}).get("positive_chunk_lengths", {}).get("mean") is not None
@@ -876,21 +908,23 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
         or not gates["same_commit_across_groups"]
         or not gates["repetition_integrity"]
         or not gates["experimental_validity"]
+        or not gates["baseline_correctness_A_ge_80pct"]
     ):
         conclusion = "INCONCLUSIVE"
     elif not gates["correctness_B_within_5pp"] or not gates["correctness_C_within_5pp"]:
         conclusion = "NEEDS_REVISION"
-    elif not all(gates[name] for name in (
-        "coverage_B_ge_80pct",
-        "coverage_C_ge_80pct",
-        "mean_chunk_length_B_ge_1_8",
-        "mean_chunk_length_C_ge_1_8",
-        "logical_reduction_B_ge_15pct",
-        "logical_reduction_C_ge_15pct",
-    )):
-        conclusion = "INCONCLUSIVE"
     else:
-        conclusion = "PASS"
+        if not all(gates[name] for name in (
+            "coverage_B_ge_80pct",
+            "coverage_C_ge_80pct",
+            "mean_chunk_length_B_ge_1_8",
+            "mean_chunk_length_C_ge_1_8",
+            "logical_reduction_B_ge_15pct",
+            "logical_reduction_C_ge_15pct",
+        )):
+            conclusion = "INCONCLUSIVE"
+        else:
+            conclusion = "PASS"
 
     primary_group_commits = {}
     for group, group_artifacts in artifacts.items():
@@ -919,6 +953,9 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
             "task_count_is_10": len(task_ids) == 10,
             "exactly_one_repetition": integrity["exact_one_repetition"],
             "A_pass_rate_ge_80pct": groups.get("A", {}).get("pass_rate", 0.0) >= 0.80,
+            "correctness_B_within_5pp": groups.get("B", {}).get("pass_rate", 0.0) >= a_pass - 0.05,
+            "correctness_C_within_5pp": groups.get("C", {}).get("pass_rate", 0.0) >= a_pass - 0.05,
+            "experimental_validity": experimental_validity["valid"],
             "coverage_B_ge_70pct": groups.get("B", {}).get("positive_chunk_coverage", 0.0) >= 0.70,
             "coverage_C_ge_70pct": groups.get("C", {}).get("positive_chunk_coverage", 0.0) >= 0.70,
             "mean_chunk_length_B_ge_1_5": groups.get("B", {}).get("positive_chunk_lengths", {}).get("mean") is not None
@@ -928,9 +965,17 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
             "protocol_errors_not_systemic": all(rate <= 0.20 for rate in protocol_rates.values()),
         }
         pilot_status = "PASS" if all(pilot_gates.values()) else "FAIL"
-        if not pilot_gates["task_count_is_10"] or not pilot_gates["exactly_one_repetition"]:
+        if (
+            not pilot_gates["task_count_is_10"]
+            or not pilot_gates["exactly_one_repetition"]
+            or not pilot_gates["experimental_validity"]
+        ):
             pilot_reason = "pilot_contract_invalid"
-        elif not pilot_gates["A_pass_rate_ge_80pct"]:
+        elif not all(pilot_gates[name] for name in (
+            "A_pass_rate_ge_80pct",
+            "correctness_B_within_5pp",
+            "correctness_C_within_5pp",
+        )):
             pilot_reason = "insufficient_correctness"
         elif not all(pilot_gates[name] for name in (
             "coverage_B_ge_70pct",
@@ -994,7 +1039,6 @@ def render_report(summary, environment):
         lines.append(f"- {group} commit: `{group_commits.get(group, 'n/a')}`")
     lines.extend([
         f"- Same commit across A/B/C: `{'PASS' if validity.get('same_commit') else 'FAIL'}`",
-        "- Only treatment variable: `action_chunking`",
         "",
         "## Group metrics",
         "",
@@ -1319,23 +1363,18 @@ def run_real_benchmark(
         "historical_baseline_commit_sha": ORIGINAL_BASELINE_SHA,
         "group_commits": {group: commit_sha for group in groups},
     }
+    environment["expected_contract"] = {
+        "task_prompt_snapshot_id": environment["task_prompt_snapshot_id"],
+        "fixture_snapshot_id": environment["fixture_snapshot_id"],
+        "step_budget_summary": _step_budget_summary(
+            [task for task in benchmark["tasks"] if task["id"] in task_ids]
+        ),
+    }
     preflight = _preflight(api_key, base_url, timeout)
     environment["preflight"] = preflight
     _json_write(run_root / "environment.json", environment)
     if preflight.get("status") != "passed":
-        experimental_validity = {
-            "same_commit": False,
-            "same_model": False,
-            "same_decoding": False,
-            "same_task_ids": False,
-            "same_prompt_snapshot": False,
-            "same_fixture_snapshot": False,
-            "same_step_budget": False,
-            "same_execution_config": False,
-            "action_chunking_unique_treatment": False,
-            "all_required_fields_consistent": False,
-            "valid": False,
-        }
+        experimental_validity = _experimental_validity({}, task_ids, environment["expected_contract"])
         summary = {
             "schema_version": 1,
             "mode": mode,
@@ -1349,6 +1388,7 @@ def run_real_benchmark(
                 "same_commit_across_groups": False,
                 "repetition_integrity": False,
                 "experimental_validity": False,
+                "baseline_correctness_A_ge_80pct": False,
                 "token_metric_valid": False,
             },
             "primary_ablation": {
@@ -1465,7 +1505,12 @@ def run_real_benchmark(
             _json_write(artifact_path, _redact(artifact, api_key))
             artifact_paths[group].append(artifact_path)
 
-    summary = summarize_real_artifacts(artifact_paths, task_ids, mode=mode)
+    summary = summarize_real_artifacts(
+        artifact_paths,
+        task_ids,
+        mode=mode,
+        expected_contract=environment["expected_contract"],
+    )
     summary["preflight"] = preflight
     summary["compatibility_regression"] = compatibility_regression
     summary["historical_reference"] = historical_reference

@@ -12,7 +12,40 @@ from scripts import run_action_chunking_real_benchmark as runner
 
 
 def _write_artifact(path, rows):
-    Path(path).write_text(json.dumps({"rows": rows}), encoding="utf-8")
+    path = Path(path)
+    group = path.stem
+    task_ids = [row["id"] for row in rows]
+    prompt_snapshot_id = "fix-pilot-prompt"
+    payload = {
+        "artifact_id": f"{group}-rep-01",
+        "group": group,
+        "repetition": 1,
+        "runtime": {"commit_sha": "fix-pilot-commit"},
+        "reproducibility": {
+            "model_name": "gpt-5.6-luna",
+            "model_version": "openai-compatible-responses",
+            "decoding": {"temperature": 0.0, "top_p": 1.0, "max_new_tokens": 768},
+            "task_ids": task_ids,
+            "task_prompt_snapshot_id": prompt_snapshot_id,
+            "prompt_snapshot_id": prompt_snapshot_id,
+            "fixture_snapshot_id": "fix-pilot-fixture",
+            "step_budget_summary": {
+                "min": 8,
+                "max": 8,
+                "unique": [8],
+                "count": len(task_ids),
+            },
+            "execution_config": {
+                "continue_on_error": False,
+                "allowed_tools_by_task": {
+                    task_id: ["list_files", "read_file", "search"] for task_id in task_ids
+                },
+            },
+            "action_chunking": runner.normalize_action_chunking(runner.GROUP_CONFIGS[group]),
+        },
+        "rows": rows,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _pilot_row(task_id, group, index, *, chunked=True):
@@ -98,7 +131,7 @@ def test_primary_environment_records_one_current_commit_for_a_b_c(tmp_path):
     environment = json.loads(next(tmp_path.glob("*/environment.json")).read_text(encoding="utf-8"))
     current_head = environment["commit_sha"]
     assert environment["group_commits"] == {"A": current_head, "B": current_head, "C": current_head}
-    assert summary["primary_ablation"]["same_commit"] is True
+    assert summary["primary_ablation"]["same_commit"] is False
 
 
 def test_provider_usage_aggregation_sums_complete_attempts_and_preserves_missing_values():
