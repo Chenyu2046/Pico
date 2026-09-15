@@ -74,9 +74,16 @@ def test_fake_model_a_b_c_contract_has_chunk_coverage_and_boundary_interrupts(tm
         {group: [tmp_path / f"deterministic-{group}.json"] for group in GROUP_CONFIGS},
         task_ids,
     )
-    assert summary["conclusion"] == "PASS"
+    assert summary["artifact_integrity"]["repetition_integrity"] is False
+    assert summary["gates"]["repetition_integrity"] is False
+    assert summary["conclusion"] == "INCONCLUSIVE"
+    assert summary["final_conclusion"] == "INCONCLUSIVE"
     assert summary["primary_ablation"]["same_commit"] is True
     assert len(set(summary["primary_ablation"]["group_commits"].values())) == 1
+    assert summary["gates"]["same_commit_across_groups"] is True
+    assert summary["experimental_validity"]["all_required_fields_consistent"] is True
+    assert summary["experimental_validity"]["action_chunking_unique_treatment"] is True
+    assert summary["gates"]["experimental_validity"] is True
     assert summary["gates"]["token_metric_valid"] is True
     assert summary["comparisons"]["B_vs_A"]["logical_decisions"]["reduction_pct"] > 15
 
@@ -97,6 +104,9 @@ def test_real_runner_records_blocked_preflight_without_running_tasks(tmp_path):
 
     assert summary["conclusion"] == "INCONCLUSIVE"
     assert summary["preflight"]["status"] == "blocked"
+    assert summary["primary_ablation"]["same_commit"] is False
+    assert summary["experimental_validity"]["same_commit"] is False
+    assert summary["gates"]["same_commit_across_groups"] is False
     assert (artifact_root / "environment.json").exists()
     assert not list(artifact_root.glob("A/rep-*.json"))
 

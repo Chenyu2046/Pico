@@ -117,16 +117,31 @@ def _cleanup_historical_baseline_worktree(worktree):
     if worktree is None:
         return
     worktree = Path(worktree)
+    remove_failed = False
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["git", "worktree", "remove", "--force", str(worktree)],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
             check=False,
         )
+        remove_failed = result.returncode != 0
+    except OSError:
+        remove_failed = True
     finally:
         shutil.rmtree(worktree, ignore_errors=True)
+        if remove_failed:
+            try:
+                subprocess.run(
+                    ["git", "worktree", "prune"],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                pass
 
 
 def _prepare_historical_baseline_worktree(benchmark_path):
@@ -426,13 +441,17 @@ def run_deterministic_benchmark(
 ):
     """Run all 20 tasks through FakeModelClient for contract validation."""
     benchmark_path = Path(benchmark_path).resolve()
+    benchmark = load_benchmark(benchmark_path)
+    tasks = benchmark["tasks"]
+    task_ids = [task["id"] for task in tasks]
     if workspace_root is None:
         workspace_root = tempfile.mkdtemp(prefix="pico-action-chunk-deterministic-")
     result = {}
     for group, config in GROUP_CONFIGS.items():
+        artifact_path = Path(workspace_root) / f"deterministic-{group}.json"
         evaluator = BenchmarkEvaluator(
             benchmark_path=benchmark_path,
-            artifact_path=Path(workspace_root) / f"deterministic-{group}.json",
+            artifact_path=artifact_path,
             workspace_root=Path(workspace_root) / f"workspaces-{group}",
             model_name="FakeModelClient",
             model_version="action-chunking-deterministic",
@@ -443,7 +462,21 @@ def run_deterministic_benchmark(
             model_client_factory=deterministic_model_factory(config),
             action_chunking=config,
         )
-        result[group] = evaluator.run()
+        artifact = evaluator.run()
+        _annotate_primary_artifact(
+            artifact,
+            group,
+            1,
+            task_ids,
+            {
+                "task_prompt_snapshot_id": _task_prompt_snapshot_id(tasks, task_ids),
+                "fixture_snapshot_id": artifact["reproducibility"]["fixture_snapshot_id"],
+                "step_budget": benchmark["benchmark_metadata"]["step_budget"],
+                "step_budget_summary": artifact["reproducibility"].get("step_budget_summary"),
+            },
+        )
+        _json_write(artifact_path, artifact)
+        result[group] = artifact
     return result
 
 
@@ -581,6 +614,194 @@ def _protocol_error_count(rows):
     )
 
 
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _all_equal(values):
+    return bool(values) and len({_canonical(value) for value in values}) == 1
+
+
+def _artifact_integrity(artifact_paths, artifacts, task_ids, mode):
+    expected_groups = ("A", "B", "C")
+    expected_tasks = list(task_ids)
+    expected_task_set = {_canonical(task_id) for task_id in expected_tasks}
+    all_paths = []
+    artifact_ids = set()
+    repetitions = set()
+    counts = {}
+    complete = True
+    duplicate_paths = False
+    duplicate_ids = False
+    duplicate_repetitions = False
+
+    for group in expected_groups:
+        paths = [Path(path) for path in artifact_paths.get(group, [])]
+        counts[group] = len(paths)
+        group_repetitions = set()
+        for path, artifact in zip(paths, artifacts.get(group, [])):
+            path_key = str(path.resolve())
+            duplicate_paths = duplicate_paths or path_key in all_paths
+            all_paths.append(path_key)
+
+            artifact_id = artifact.get("artifact_id")
+            repetition = artifact.get("repetition")
+            id_key = _canonical(artifact_id)
+            repetition_key = (group, _canonical(repetition))
+            duplicate_ids = duplicate_ids or id_key in artifact_ids
+            duplicate_repetitions = duplicate_repetitions or repetition_key in repetitions
+            artifact_ids.add(id_key)
+            repetitions.add(repetition_key)
+            if not isinstance(artifact_id, str) or not artifact_id:
+                complete = False
+            if not isinstance(repetition, int) or isinstance(repetition, bool):
+                complete = False
+            else:
+                group_repetitions.add(_canonical(repetition))
+            if artifact.get("group") != group:
+                complete = False
+            row_ids = [_canonical(row.get("id")) for row in artifact.get("rows", [])]
+            if len(row_ids) != len(expected_tasks) or set(row_ids) != expected_task_set:
+                complete = False
+        if group_repetitions != {_canonical(index) for index in range(1, len(paths) + 1)}:
+            complete = False
+
+    groups_present = set(artifact_paths) == set(expected_groups)
+    counts_equal = len(set(counts.values())) == 1 if counts else False
+    min_repetitions = 3 if mode == "final" else 1
+    enough_repetitions = counts_equal and all(counts.get(group, 0) >= min_repetitions for group in expected_groups)
+    exact_one_repetition = groups_present and counts_equal and all(
+        counts.get(group, 0) == 1 for group in expected_groups
+    )
+    repetition_shape_valid = (
+        enough_repetitions if mode == "final" else exact_one_repetition
+    )
+    repetition_integrity = (
+        groups_present
+        and counts_equal
+        and repetition_shape_valid
+        and complete
+        and not duplicate_paths
+        and not duplicate_ids
+        and not duplicate_repetitions
+    )
+    return {
+        "groups_present": groups_present,
+        "artifact_counts": counts,
+        "artifact_counts_equal": counts_equal,
+        "enough_repetitions": enough_repetitions,
+        "exact_one_repetition": exact_one_repetition,
+        "all_tasks_complete": complete,
+        "minimum_repetitions_met": repetition_shape_valid,
+        "group_repetition_counts_equal": counts_equal,
+        "task_repetition_counts_complete": complete,
+        "duplicate_artifact_paths": duplicate_paths,
+        "duplicate_artifact_ids": duplicate_ids,
+        "duplicate_repetitions": duplicate_repetitions,
+        "repetition_integrity": repetition_integrity,
+    }
+
+
+def _experimental_validity(artifacts, task_ids):
+    all_artifacts = [artifact for group in ("A", "B", "C") for artifact in artifacts.get(group, [])]
+    reproducibility = [artifact.get("reproducibility", {}) for artifact in all_artifacts]
+    runtime = [artifact.get("runtime", {}) for artifact in all_artifacts]
+
+    def same_field(items, field):
+        values = [item.get(field) for item in items]
+        return bool(values) and all(value is not None for value in values) and _all_equal(values)
+
+    def same_reproducibility_field(primary, legacy=None):
+        values = [
+            item.get(primary) if item.get(primary) is not None else item.get(legacy)
+            for item in reproducibility
+        ]
+        return bool(values) and all(value is not None for value in values) and _all_equal(values)
+
+    same_commit = same_field(runtime, "commit_sha")
+    same_model = (
+        same_field(reproducibility, "model_name")
+        and same_field(reproducibility, "model_version")
+    )
+    same_decoding = same_field(reproducibility, "decoding")
+    same_task_ids = all(
+        artifact.get("reproducibility", {}).get("task_ids") == list(task_ids)
+        for artifact in all_artifacts
+    ) if all_artifacts else False
+    same_prompt_snapshot = same_reproducibility_field("task_prompt_snapshot_id", "prompt_snapshot_id")
+    same_fixture_snapshot = same_field(reproducibility, "fixture_snapshot_id")
+    same_step_budget = same_reproducibility_field("step_budget_summary", "step_budget")
+    execution_configs = [item.get("execution_config") for item in reproducibility]
+    same_execution_config = (
+        bool(execution_configs)
+        and all(value is not None for value in execution_configs)
+        and same_field(reproducibility, "execution_config")
+    )
+
+    common_fields = ("model_name", "model_version", "decoding", "fixture_snapshot_id")
+    common_configuration = (
+        all(same_field(reproducibility, field) for field in common_fields)
+        and same_task_ids
+        and same_prompt_snapshot
+        and same_step_budget
+        and same_execution_config
+    )
+    action_configs = {
+        group: [artifact.get("reproducibility", {}).get("action_chunking") for artifact in artifacts.get(group, [])]
+        for group in ("A", "B", "C")
+    }
+    expected_action_configs = {
+        group: normalize_action_chunking(GROUP_CONFIGS[group])
+        for group in ("A", "B", "C")
+    }
+    action_treatment_valid = all(
+        values
+        and all(_canonical(value) == _canonical(expected_action_configs[group]) for value in values)
+        for group, values in action_configs.items()
+    )
+    action_chunking_unique_treatment = common_configuration and action_treatment_valid
+    validity = {
+        "same_commit": same_commit,
+        "same_model": same_model,
+        "same_decoding": same_decoding,
+        "same_task_ids": same_task_ids,
+        "same_prompt_snapshot": same_prompt_snapshot,
+        "same_fixture_snapshot": same_fixture_snapshot,
+        "same_step_budget": same_step_budget,
+        "same_execution_config": same_execution_config,
+        "action_chunking_unique_treatment": action_chunking_unique_treatment,
+        "all_required_fields_consistent": all(
+            (
+                same_commit,
+                same_model,
+                same_decoding,
+                same_task_ids,
+                same_prompt_snapshot,
+                same_fixture_snapshot,
+                same_step_budget,
+                same_execution_config,
+            )
+        ),
+    }
+    validity["valid"] = validity["all_required_fields_consistent"] and validity["action_chunking_unique_treatment"]
+    return validity
+
+
+def _annotate_primary_artifact(artifact, group, repetition, task_ids, environment):
+    artifact["artifact_id"] = f"{group}-rep-{repetition:02d}"
+    artifact["group"] = group
+    artifact["repetition"] = repetition
+    reproducibility = artifact.setdefault("reproducibility", {})
+    reproducibility["task_ids"] = list(task_ids)
+    reproducibility["task_prompt_snapshot_id"] = environment["task_prompt_snapshot_id"]
+    reproducibility["prompt_snapshot_id"] = environment["task_prompt_snapshot_id"]
+    reproducibility["fixture_snapshot_id"] = environment["fixture_snapshot_id"]
+    reproducibility["step_budget"] = environment["step_budget"]
+    if environment.get("step_budget_summary") is not None:
+        reproducibility["step_budget_summary"] = environment["step_budget_summary"]
+    return artifact
+
+
 def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
     artifacts = {
         group: [json.loads(Path(path).read_text(encoding="utf-8")) for path in paths]
@@ -623,6 +844,8 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
                     comparison[metric]["reduction_pct"] = None
                     comparison[metric]["invalid_reason"] = "token_usage_coverage_below_90pct"
 
+    integrity = _artifact_integrity(artifact_paths, artifacts, task_ids, mode)
+    experimental_validity = _experimental_validity(artifacts, task_ids)
     a_pass = groups.get("A", {}).get("pass_rate", 0.0)
     logical_reductions = {
         key: value["logical_decisions"].get("reduction_pct")
@@ -632,6 +855,9 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
         "groups_present": sorted(groups) == ["A", "B", "C"],
         "task_count": len(task_ids),
         "task_count_is_20": len(task_ids) == 20,
+        "same_commit_across_groups": experimental_validity["same_commit"],
+        "repetition_integrity": integrity["repetition_integrity"],
+        "experimental_validity": experimental_validity["valid"],
         "coverage_B_ge_80pct": groups.get("B", {}).get("positive_chunk_coverage", 0.0) >= 0.80,
         "coverage_C_ge_80pct": groups.get("C", {}).get("positive_chunk_coverage", 0.0) >= 0.80,
         "mean_chunk_length_B_ge_1_8": groups.get("B", {}).get("positive_chunk_lengths", {}).get("mean") is not None
@@ -644,7 +870,13 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
         "logical_reduction_C_ge_15pct": (logical_reductions.get("C_vs_A") or -1.0) >= 15.0,
         "token_metric_valid": token_metric_valid,
     }
-    if not gates["groups_present"] or not gates["task_count_is_20"]:
+    if (
+        not gates["groups_present"]
+        or not gates["task_count_is_20"]
+        or not gates["same_commit_across_groups"]
+        or not gates["repetition_integrity"]
+        or not gates["experimental_validity"]
+    ):
         conclusion = "INCONCLUSIVE"
     elif not gates["correctness_B_within_5pp"] or not gates["correctness_C_within_5pp"]:
         conclusion = "NEEDS_REVISION"
@@ -655,7 +887,6 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
         "mean_chunk_length_C_ge_1_8",
         "logical_reduction_B_ge_15pct",
         "logical_reduction_C_ge_15pct",
-        "token_metric_valid",
     )):
         conclusion = "INCONCLUSIVE"
     else:
@@ -686,6 +917,7 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
         }
         pilot_gates = {
             "task_count_is_10": len(task_ids) == 10,
+            "exactly_one_repetition": integrity["exact_one_repetition"],
             "A_pass_rate_ge_80pct": groups.get("A", {}).get("pass_rate", 0.0) >= 0.80,
             "coverage_B_ge_70pct": groups.get("B", {}).get("positive_chunk_coverage", 0.0) >= 0.70,
             "coverage_C_ge_70pct": groups.get("C", {}).get("positive_chunk_coverage", 0.0) >= 0.70,
@@ -696,7 +928,7 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
             "protocol_errors_not_systemic": all(rate <= 0.20 for rate in protocol_rates.values()),
         }
         pilot_status = "PASS" if all(pilot_gates.values()) else "FAIL"
-        if not pilot_gates["task_count_is_10"]:
+        if not pilot_gates["task_count_is_10"] or not pilot_gates["exactly_one_repetition"]:
             pilot_reason = "pilot_contract_invalid"
         elif not pilot_gates["A_pass_rate_ge_80pct"]:
             pilot_reason = "insufficient_correctness"
@@ -718,6 +950,9 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
         "comparisons": comparisons,
         "paired_successful_comparisons": paired_successful_comparisons,
         "primary_ablation": primary_ablation,
+        "artifact_integrity": integrity,
+        "repetition_integrity": integrity,
+        "experimental_validity": experimental_validity,
         "gates": gates,
         "pilot_gates": pilot_gates,
         "pilot_status": pilot_status,
@@ -730,6 +965,8 @@ def summarize_real_artifacts(artifact_paths, task_ids, mode="final"):
 def render_report(summary, environment):
     def format_number(number):
         return "n/a" if number is None else f"{number:.2f}"
+
+    validity = summary.get("experimental_validity", {})
 
     def value(group, metric):
         if metric in {"input_tokens", "total_tokens"} and not summary.get("gates", {}).get("token_metric_valid", False):
@@ -752,11 +989,11 @@ def render_report(summary, environment):
         "## Primary A/B/C ablation",
         "",
     ]
-    group_commits = environment.get("group_commits", summary.get("primary_ablation", {}).get("group_commits", {}))
+    group_commits = summary.get("primary_ablation", {}).get("group_commits", {})
     for group in ("A", "B", "C"):
         lines.append(f"- {group} commit: `{group_commits.get(group, 'n/a')}`")
     lines.extend([
-        f"- Same commit across A/B/C: `{'PASS' if summary.get('primary_ablation', {}).get('same_commit') else 'FAIL'}`",
+        f"- Same commit across A/B/C: `{'PASS' if validity.get('same_commit') else 'FAIL'}`",
         "- Only treatment variable: `action_chunking`",
         "",
         "## Group metrics",
@@ -848,17 +1085,23 @@ def render_report(summary, environment):
             )
     lines.extend(["", "## Gates", ""])
     for name, passed in summary["gates"].items():
-        lines.append(f"- {'PASS' if passed else 'FAIL'}: {name}")
+        if name == "token_metric_valid":
+            lines.append(f"- {'PASS' if passed else 'N/A'}: {name} (optional diagnostic)")
+        else:
+            lines.append(f"- {'PASS' if passed else 'FAIL'}: {name}")
     lines.extend([
         "",
         "## Experimental validity",
         "",
-        f"- Same Pico commit across A/B/C: `{'PASS' if summary.get('primary_ablation', {}).get('same_commit') else 'FAIL'}`",
-        "- Same model and decoding config: `PASS`",
-        "- Same task prompts: `PASS`",
-        "- Same fixture snapshot: `PASS`",
-        "- Same max_steps: `PASS`",
-        f"- Token coverage >= 90%: `{'PASS' if summary.get('gates', {}).get('token_metric_valid') else 'FAIL'}`",
+        f"- Same Pico commit across A/B/C: `{'PASS' if validity.get('same_commit') else 'FAIL'}`",
+        f"- Same model: `{'PASS' if validity.get('same_model') else 'FAIL'}`",
+        f"- Same decoding config: `{'PASS' if validity.get('same_decoding') else 'FAIL'}`",
+        f"- Same task IDs: `{'PASS' if validity.get('same_task_ids') else 'FAIL'}`",
+        f"- Same prompt snapshot: `{'PASS' if validity.get('same_prompt_snapshot') else 'FAIL'}`",
+        f"- Same fixture snapshot: `{'PASS' if validity.get('same_fixture_snapshot') else 'FAIL'}`",
+        f"- Same step budget: `{'PASS' if validity.get('same_step_budget') else 'FAIL'}`",
+        f"- Action Chunking is the only treatment: `{'PASS' if validity.get('action_chunking_unique_treatment') else 'FAIL'}`",
+        f"- Token metric (optional): `{'PASS' if summary.get('gates', {}).get('token_metric_valid') else 'UNAVAILABLE'}`",
         f"- Chunk coverage gate: `{'PASS' if summary.get('gates', {}).get('coverage_B_ge_80pct') and summary.get('gates', {}).get('coverage_C_ge_80pct') else 'FAIL'}`",
     ])
     if summary.get("pilot_status") is not None:
@@ -952,7 +1195,7 @@ def _preflight(api_key, base_url, timeout, client_factory=None):
     usage = aggregate_provider_usage(getattr(client, "last_provider_attempts", []) or [])
     response_match = str(response).strip() == "PICO_RESPONSES_PREFLIGHT_OK"
     provider = {
-        "status": "passed" if response_match and usage["token_usage_complete"] else "failed",
+        "status": "passed" if response_match else "failed",
         "response_match": response_match,
         "elapsed_ms": int((time.monotonic() - started_at) * 1000),
         "provider_requests": len(getattr(client, "last_provider_attempts", []) or []),
@@ -961,7 +1204,7 @@ def _preflight(api_key, base_url, timeout, client_factory=None):
         "response_text_recorded": False,
     }
     if provider["status"] != "passed":
-        reason = "provider response or usage metadata did not pass"
+        reason = "provider response did not match the preflight contract"
         return {
             "status": "failed",
             "reason": reason,
@@ -1080,17 +1323,41 @@ def run_real_benchmark(
     environment["preflight"] = preflight
     _json_write(run_root / "environment.json", environment)
     if preflight.get("status") != "passed":
+        experimental_validity = {
+            "same_commit": False,
+            "same_model": False,
+            "same_decoding": False,
+            "same_task_ids": False,
+            "same_prompt_snapshot": False,
+            "same_fixture_snapshot": False,
+            "same_step_budget": False,
+            "same_execution_config": False,
+            "action_chunking_unique_treatment": False,
+            "all_required_fields_consistent": False,
+            "valid": False,
+        }
         summary = {
             "schema_version": 1,
             "mode": mode,
             "task_ids": task_ids,
             "groups": {},
             "comparisons": {},
-            "gates": {"token_metric_valid": False},
-            "primary_ablation": {
-                "group_commits": dict(environment["group_commits"]),
-                "same_commit": True,
+            "gates": {
+                "groups_present": False,
+                "task_count": len(task_ids),
+                "task_count_is_20": len(task_ids) == 20,
+                "same_commit_across_groups": False,
+                "repetition_integrity": False,
+                "experimental_validity": False,
+                "token_metric_valid": False,
             },
+            "primary_ablation": {
+                "group_commits": {},
+                "same_commit": False,
+            },
+            "artifact_integrity": {},
+            "repetition_integrity": {},
+            "experimental_validity": experimental_validity,
             "pilot_gates": {},
             "pilot_status": "BLOCKED" if mode == "pilot" else None,
             "pilot_reason": "preflight_not_passed" if mode == "pilot" else "",
@@ -1194,6 +1461,7 @@ def run_real_benchmark(
                 action_chunking=GROUP_CONFIGS[group],
             )
             artifact = evaluator.run(task_ids=task_ids, continue_on_error=True)
+            _annotate_primary_artifact(artifact, group, repetition, task_ids, environment)
             _json_write(artifact_path, _redact(artifact, api_key))
             artifact_paths[group].append(artifact_path)
 

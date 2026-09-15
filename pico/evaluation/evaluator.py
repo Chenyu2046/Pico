@@ -276,6 +276,24 @@ def _fixture_snapshot_id(fixture_paths):
     return "sha256:" + sha.hexdigest()
 
 
+def _task_prompt_snapshot_id(tasks):
+    payload = "\n".join(
+        f"{task['id']}\0{task['prompt']}"
+        for task in tasks
+    )
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _step_budget_summary(tasks):
+    budgets = [int(task["step_budget"]) for task in tasks]
+    return {
+        "min": min(budgets) if budgets else None,
+        "max": max(budgets) if budgets else None,
+        "unique": sorted(set(budgets)),
+        "count": len(budgets),
+    }
+
+
 def validate_benchmark(data, repo_root=None):
     if not isinstance(data, dict):
         raise ValueError("benchmark must be a mapping")
@@ -599,6 +617,14 @@ class BenchmarkEvaluator:
                 "timezone": self.timezone_name,
                 "locale": _current_locale(),
                 "task_ids": [task["id"] for task in tasks],
+                "task_prompt_snapshot_id": _task_prompt_snapshot_id(tasks),
+                "step_budget_summary": _step_budget_summary(tasks),
+                "execution_config": {
+                    "continue_on_error": bool(continue_on_error),
+                    "allowed_tools_by_task": {
+                        task["id"]: list(task["allowed_tools"]) for task in tasks
+                    },
+                },
                 "action_chunking": dict(self.action_chunking),
             },
             "summary": summary,

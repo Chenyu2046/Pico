@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 from pathlib import Path
@@ -76,11 +77,46 @@ def _fixture_fact(fixture_root, name):
         return {"values": [match]}
     if name == "request_order":
         source = read(Path("app/service.py"))
-        order = [
-            name
-            for name in ("validate_request", "route_request", "get_or_put", "format_response")
-            if name in source
-        ]
+        tree = ast.parse(source, filename="app/service.py")
+        handle_request = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "handle_request"
+            ),
+            None,
+        )
+        assert handle_request is not None, "handle_request was not found in the fixture"
+
+        expected = ("validate_request", "route_request", "get_or_put", "format_response")
+        order = []
+
+        class _RequestOrderVisitor(ast.NodeVisitor):
+            def visit_Call(self, node):
+                function = node.func
+                called_name = function.id if isinstance(function, ast.Name) else (
+                    function.attr if isinstance(function, ast.Attribute) else None
+                )
+                if called_name in expected:
+                    order.append(called_name)
+                self.generic_visit(node)
+
+            def visit_Lambda(self, node):
+                return None
+
+            def visit_FunctionDef(self, node):
+                return None
+
+            def visit_AsyncFunctionDef(self, node):
+                return None
+
+            def visit_ClassDef(self, node):
+                return None
+
+        visitor = _RequestOrderVisitor()
+        for statement in handle_request.body:
+            visitor.visit(statement)
         assert order == ["validate_request", "route_request", "get_or_put", "format_response"]
         return {"values": order, "ordered": order}
     if name == "route_health":
